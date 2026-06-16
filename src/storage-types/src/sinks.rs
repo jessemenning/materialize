@@ -137,6 +137,7 @@ pub enum SinkEnvelope {
 pub enum StorageSinkConnection<C: ConnectionAccess = InlinedConnection> {
     Kafka(KafkaSinkConnection<C>),
     Iceberg(IcebergSinkConnection<C>),
+    Solace(SolaceSinkConnection<C>),
 }
 
 impl<C: ConnectionAccess> StorageSinkConnection<C> {
@@ -159,6 +160,11 @@ impl<C: ConnectionAccess> StorageSinkConnection<C> {
             (StorageSinkConnection::Iceberg(s), StorageSinkConnection::Iceberg(o)) => {
                 s.alter_compatible(id, o)?
             }
+            (StorageSinkConnection::Solace(s), StorageSinkConnection::Solace(o)) => {
+                if s != o {
+                    return Err(AlterError { id });
+                }
+            }
             _ => {
                 tracing::warn!(
                     "StorageSinkConnection incompatible:\nself:\n{:#?}\n\nother\n{:#?}",
@@ -180,6 +186,7 @@ impl<R: ConnectionResolver> IntoInlineConnection<StorageSinkConnection, R>
         match self {
             Self::Kafka(conn) => StorageSinkConnection::Kafka(conn.into_inline_connection(r)),
             Self::Iceberg(conn) => StorageSinkConnection::Iceberg(conn.into_inline_connection(r)),
+            Self::Solace(conn) => StorageSinkConnection::Solace(conn.into_inline_connection(r)),
         }
     }
 }
@@ -194,6 +201,7 @@ impl<C: ConnectionAccess> StorageSinkConnection<C> {
                 catalog_connection_id: connection_id,
                 ..
             }) => Some(*connection_id),
+            Solace(SolaceSinkConnection { connection_id, .. }) => Some(*connection_id),
         }
     }
 
@@ -203,6 +211,7 @@ impl<C: ConnectionAccess> StorageSinkConnection<C> {
         match self {
             Kafka(_) => "kafka",
             Iceberg(_) => "iceberg",
+            Solace(_) => "solace",
         }
     }
 }
@@ -810,6 +819,50 @@ impl<R: ConnectionResolver> IntoInlineConnection<IcebergSinkConnection, R>
             key_desc_and_indices,
             namespace,
             table,
+        }
+    }
+}
+
+/// Connection parameters for a Solace sink.
+///
+/// Publishes rows as direct JSON messages to a Solace topic derived from a
+/// template string with `{column_name}` placeholders substituted per-row.
+/// Only `mz_diff > 0` rows are published; retractions are silently dropped.
+/// Optional dedup window suppresses re-publishing the same topic within a
+/// configurable time interval.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SolaceSinkConnection<C: ConnectionAccess = InlinedConnection> {
+    pub connection_id: CatalogItemId,
+    pub connection: C::Solace,
+    /// Schema of the rows being sinked.
+    pub value_desc: RelationDesc,
+    /// Raw topic template string, e.g. `"mz/airspace-density/{lat_cell}/{lon_cell}"`.
+    pub topic: String,
+    /// Resolved `(placeholder_name, column_index)` pairs extracted at plan time.
+    pub topic_column_indices: Vec<(String, usize)>,
+    /// If `Some`, suppress re-publishing the same rendered topic within this window.
+    pub dedup_window: Option<Duration>,
+}
+
+impl<R: ConnectionResolver> IntoInlineConnection<SolaceSinkConnection, R>
+    for SolaceSinkConnection<ReferencedConnection>
+{
+    fn into_inline_connection(self, r: R) -> SolaceSinkConnection {
+        let SolaceSinkConnection {
+            connection_id,
+            connection,
+            value_desc,
+            topic,
+            topic_column_indices,
+            dedup_window,
+        } = self;
+        SolaceSinkConnection {
+            connection_id,
+            connection: r.resolve_connection(connection).unwrap_solace(),
+            value_desc,
+            topic,
+            topic_column_indices,
+            dedup_window,
         }
     }
 }
