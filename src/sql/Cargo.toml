@@ -72,6 +72,7 @@ proptest.workspace = true
 proptest-derive.workspace = true
 prost.workspace = true
 rdkafka.workspace = true
+humantime.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true

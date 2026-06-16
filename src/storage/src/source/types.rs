@@ -195,6 +195,7 @@ impl_fuel_size_stack!(
     Diff,
     mz_repr::Timestamp,
     mz_storage_types::sources::MzOffset,
+    mz_storage_types::sources::solace::SolaceTimestamp,
     mz_sql_server_util::cdc::Lsn,
     DataflowError,
 );

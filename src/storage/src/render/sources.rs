@@ -511,6 +511,38 @@ fn upsert_commands<'scope, T: Timestamp, FromTime: Timestamp>(
     input.map(move |result| {
         let from_time = result.from_time;
 
+        // MetadataKey: for sources like Solace FORMAT JSON that have no native message key.
+        // The key is assembled from INCLUDE metadata columns (e.g. tl_N from TOPIC LEVELS).
+        if let UpsertStyle::MetadataKey { ref key_metadata_indices } = upsert_envelope.style {
+            let metadata = result.metadata;
+            // Collect once so each key column is O(1) to index; avoids re-walking the datum
+            // iterator O(idx) times for every key column on every message.
+            let metadata_datums: Vec<Datum<'_>> = metadata.iter().collect();
+            {
+                let mut packer = row_buf.packer();
+                for &idx in key_metadata_indices.iter() {
+                    packer.push(metadata_datums.get(idx).copied().unwrap_or(Datum::Null));
+                }
+            }
+            let key_row = row_buf.clone();
+            let upsert_key = UpsertKey::from_key(Ok(&key_row));
+
+            let value = match result.value {
+                Some(Ok(ref row)) => {
+                    let mut packer = row_buf.packer();
+                    packer.extend_by_row(row);       // value cols (e.g. `data` jsonb)
+                    packer.extend_by_row(&metadata); // metadata cols (tl_1..tl_N, broker_ts, topic)
+                    Some(Ok(row_buf.clone()))
+                }
+                Some(Err(inner)) => Some(Err(Box::new(UpsertError::Value(UpsertValueError {
+                    for_key: key_row,
+                    inner,
+                })))),
+                None => None,
+            };
+            return (upsert_key, value, from_time);
+        }
+
         let key = match result.key {
             Some(Ok(key)) => Ok(key),
             None => Err(UpsertError::NullKey(UpsertNullKeyError)),
@@ -559,6 +591,8 @@ fn upsert_commands<'scope, T: Timestamp, FromTime: Timestamp>(
                 key_envelope: KeyEnvelope::None,
                 error_column: _,
             } => unreachable!(),
+            // MetadataKey is handled by the early-return above
+            UpsertStyle::MetadataKey { .. } => unreachable!(),
         };
 
         let key = UpsertKey::from_key(Ok(&key_row));
@@ -593,6 +627,8 @@ fn upsert_commands<'scope, T: Timestamp, FromTime: Timestamp>(
                     packer.extend_by_row(&metadata);
                     Some(Ok(row_buf.clone()))
                 }
+                // MetadataKey is handled by the early-return above
+                UpsertStyle::MetadataKey { .. } => unreachable!(),
             },
             Some(Err(inner)) => {
                 match upsert_envelope.style {

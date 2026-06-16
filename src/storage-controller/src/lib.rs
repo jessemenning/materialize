@@ -2499,11 +2499,12 @@ impl StorageController for Controller {
                         (connection.clone(), *remap_collection_id)
                     }
 
-                    // These internal sources do not yet (and might never)
-                    // support RTR. However, erroring if they're selected from
-                    // poses an annoying user experience, so instead just skip
-                    // over them.
-                    GenericSourceConnection::LoadGenerator(_) => continue,
+                    // These sources do not yet (or might never) support RTR.
+                    // Skip rather than error, matching the load generator
+                    // behavior; Solace RTR support lands no earlier than
+                    // Phase 3.
+                    GenericSourceConnection::LoadGenerator(_)
+                    | GenericSourceConnection::Solace(_) => continue,
                 },
                 // Skip over all other objects
                 _ => {

@@ -37,8 +37,8 @@ use mz_storage_types::connections::{
     CsrConnectionHttpAuth, GlueSchemaRegistryConnection, IcebergCatalogAuth,
     IcebergCatalogConnection, IcebergCatalogImpl, IcebergCatalogType, KafkaConnection,
     KafkaSaslConfig, KafkaTlsConfig, KafkaTopicOptions, MySqlConnection, MySqlSslMode,
-    PostgresConnection, RestIcebergCatalog, S3TablesRestIcebergCatalog, SqlServerConnectionDetails,
-    SshConnection, SshTunnel, TlsIdentity, Tunnel,
+    PostgresConnection, RestIcebergCatalog, S3TablesRestIcebergCatalog, SolaceConnection,
+    SqlServerConnectionDetails, SshConnection, SshTunnel, TlsIdentity, Tunnel,
 };
 
 use crate::names::Aug;
@@ -62,6 +62,7 @@ generate_extracted_config!(
     (Endpoint, String),
     (GcpConnection, with_options::Object),
     (Host, String),
+    (MessageVpn, String),
     (Password, with_options::Secret),
     (Port, u16),
     (ProgressTopic, String),
@@ -198,6 +199,7 @@ pub(super) fn validate_options_per_connection_type(
             Url,
             Warehouse,
         ],
+        CreateConnectionType::Solace => &[Host, MessageVpn, User, Password],
     };
 
     for o in permitted_options {
@@ -751,6 +753,33 @@ impl ConnectionOptionExtracted {
                 };
 
                 ConnectionDetails::IcebergCatalog(IcebergCatalogConnection { catalog, uri })
+            }
+            CreateConnectionType::Solace => {
+                let host = self
+                    .host
+                    .ok_or_else(|| sql_err!("HOST option is required"))?;
+                let msg_vpn = self
+                    .message_vpn
+                    .ok_or_else(|| sql_err!("MESSAGE VPN option is required"))?;
+                let username = match self
+                    .user
+                    .ok_or_else(|| sql_err!("USER option is required"))?
+                {
+                    StringOrSecret::String(s) => s,
+                    StringOrSecret::Secret(_) => sql_bail!(
+                        "Solace connections do not support supplying USER value as SECRET"
+                    ),
+                };
+                let password = self
+                    .password
+                    .ok_or_else(|| sql_err!("PASSWORD option is required"))?
+                    .into();
+                ConnectionDetails::Solace(SolaceConnection {
+                    host,
+                    msg_vpn,
+                    username,
+                    password,
+                })
             }
         };
 

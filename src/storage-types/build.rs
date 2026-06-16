@@ -27,6 +27,7 @@ fn main() {
                 "storage-types/src/sources/postgres.proto",
                 "storage-types/src/sources/sql_server.proto",
                 "storage-types/src/sources/load_generator.proto",
+                "storage-types/src/sources/solace.proto",
             ],
             &[PathBuf::from(".."), mz_build_tools::protoc_include()],
         )

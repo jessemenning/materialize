@@ -1057,6 +1057,9 @@ impl DataSourceDesc {
                     mz_storage_types::sources::envelope::UpsertStyle::ValueErrInline { .. } => {
                         "upsert-value-err-inline"
                     }
+                    mz_storage_types::sources::envelope::UpsertStyle::MetadataKey { .. } => {
+                        "upsert"
+                    }
                 },
                 SourceEnvelope::CdcV2 => {
                     // TODO(aljoscha): Should we even report this? It's
@@ -1262,6 +1265,8 @@ impl Source {
                         | LoadGenerator::Tpch { .. } => 0,
                     },
                     GenericSourceConnection::Kafka(_) => 1,
+                    // Solace, like Kafka, outputs to its primary data shard.
+                    GenericSourceConnection::Solace(_) => 1,
                 }
             }
             //  DataSourceDesc::IngestionExport represents a subsource, which
@@ -1339,7 +1344,7 @@ impl Sink {
     pub fn combined_format(&self) -> Option<Cow<'_, str>> {
         match &self.connection {
             StorageSinkConnection::Kafka(connection) => Some(connection.format.get_format_name()),
-            StorageSinkConnection::Iceberg(_) => None,
+            StorageSinkConnection::Iceberg(_) | StorageSinkConnection::Solace(_) => None,
         }
     }
 
@@ -1355,7 +1360,7 @@ impl Sink {
                 let value_format = connection.format.value_format.get_format_name();
                 Some((key_format, value_format))
             }
-            StorageSinkConnection::Iceberg(_) => None,
+            StorageSinkConnection::Iceberg(_) | StorageSinkConnection::Solace(_) => None,
         }
     }
 

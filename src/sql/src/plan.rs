@@ -1705,6 +1705,7 @@ pub enum ConnectionDetails {
     MySql(MySqlConnection<ReferencedConnection>),
     SqlServer(SqlServerConnectionDetails<ReferencedConnection>),
     IcebergCatalog(IcebergCatalogConnection<ReferencedConnection>),
+    Solace(mz_storage_types::connections::SolaceConnection),
 }
 
 impl ConnectionDetails {
@@ -1736,6 +1737,9 @@ impl ConnectionDetails {
             }
             ConnectionDetails::IcebergCatalog(c) => {
                 mz_storage_types::connections::Connection::IcebergCatalog(c.clone())
+            }
+            ConnectionDetails::Solace(c) => {
+                mz_storage_types::connections::Connection::Solace(c.clone())
             }
         }
     }

@@ -88,14 +88,14 @@ use mz_storage_types::connections::inline::ReferencedConnection;
 use mz_storage_types::connections::{Connection, KafkaTopicOptions};
 use mz_storage_types::sinks::{
     IcebergSinkConnection, KafkaIdStyle, KafkaSinkConnection, KafkaSinkFormat, KafkaSinkFormatType,
-    SinkEnvelope, StorageSinkConnection, iceberg_type_overrides,
+    SinkEnvelope, SolaceSinkConnection, StorageSinkConnection, iceberg_type_overrides,
 };
 use mz_storage_types::sources::encoding::{
     AvroEncoding, ColumnSpec, CsvEncoding, DataEncoding, ProtobufEncoding, RegexEncoding,
     SourceDataEncoding, included_column_desc,
 };
 use mz_storage_types::sources::envelope::{
-    KeyEnvelope, NoneEnvelope, SourceEnvelope, UnplannedSourceEnvelope, UpsertStyle,
+    KeyEnvelope, NoneEnvelope, SourceEnvelope, UnplannedSourceEnvelope, UpsertEnvelope, UpsertStyle,
 };
 use mz_storage_types::sources::kafka::{
     KafkaMetadataKind, KafkaSourceConnection, KafkaSourceExportDetails, kafka_metadata_columns_desc,
@@ -110,6 +110,10 @@ use mz_storage_types::sources::mysql::{
 use mz_storage_types::sources::postgres::{
     PostgresSourceConnection, PostgresSourcePublicationDetails,
     ProtoPostgresSourcePublicationDetails,
+};
+use mz_storage_types::sources::solace::{
+    SolaceBindEntity, SolaceMetadataKind, SolaceSourceConnection, SolaceSourceExportDetails,
+    solace_metadata_columns_desc,
 };
 use mz_storage_types::sources::sql_server::{
     ProtoSqlServerSourceExtras, SqlServerSourceExportDetails,
@@ -797,7 +801,9 @@ pub fn plan_create_source(
     }
     if !matches!(
         source_connection,
-        CreateSourceConnection::Kafka { .. } | CreateSourceConnection::LoadGenerator { .. }
+        CreateSourceConnection::Kafka { .. }
+            | CreateSourceConnection::LoadGenerator { .. }
+            | CreateSourceConnection::Solace { .. }
     ) && !include_metadata.is_empty()
     {
         bail_unsupported!("INCLUDE metadata with non-Kafka sources");
@@ -823,11 +829,25 @@ pub fn plan_create_source(
         seen: _,
     } = CreateSourceOptionExtracted::try_from(with_options.clone())?;
 
-    let metadata_columns_desc = match external_connection {
+    // Solace metadata columns are owned strings (TopicLevels generates new
+    // strings at planning time), so we need a separate owner that lives long
+    // enough for the references in metadata_columns_desc to remain valid.
+    let _solace_owned_metadata: Vec<(String, SqlColumnType)>;
+    let metadata_columns_desc: Vec<(&str, SqlColumnType)> = match external_connection {
         GenericSourceConnection::Kafka(KafkaSourceConnection {
             ref metadata_columns,
             ..
         }) => kafka_metadata_columns_desc(metadata_columns),
+        GenericSourceConnection::Solace(SolaceSourceConnection {
+            ref metadata_columns,
+            ..
+        }) => {
+            _solace_owned_metadata = solace_metadata_columns_desc(metadata_columns);
+            _solace_owned_metadata
+                .iter()
+                .map(|(s, t)| (s.as_str(), t.clone()))
+                .collect()
+        }
         _ => vec![],
     };
 
@@ -940,6 +960,11 @@ pub fn plan_create_source(
                 GenericSourceConnection::Postgres(_)
                 | GenericSourceConnection::MySql(_)
                 | GenericSourceConnection::SqlServer(_) => SourceExportDetails::None,
+                GenericSourceConnection::Solace(ref c) => {
+                    SourceExportDetails::Solace(SolaceSourceExportDetails {
+                        metadata_columns: c.metadata_columns.clone(),
+                    })
+                }
             };
 
             let data_source = DataSourceDesc::OldSyntaxIngestion {
@@ -1058,6 +1083,15 @@ pub fn plan_generic_source_connection(
                 include_metadata,
             )?)
         }
+        CreateSourceConnection::Solace {
+            connection,
+            options,
+        } => GenericSourceConnection::Solace(plan_solace_source_connection(
+            scx,
+            connection,
+            options,
+            include_metadata,
+        )?),
     })
 }
 
@@ -1276,6 +1310,17 @@ fn plan_kafka_source_connection(
                 // handled below
                 None
             }
+            // Solace-specific INCLUDE items are not valid on Kafka sources;
+            // the parser accepts the shared grammar but they are dropped
+            // here (see the equivalent arm in source-table planning).
+            SourceIncludeMetadata::ReplicationGroupMessageId { .. }
+            | SourceIncludeMetadata::BrokerTimestamp { .. }
+            | SourceIncludeMetadata::SenderTimestamp { .. }
+            | SourceIncludeMetadata::ApplicationMessageId { .. }
+            | SourceIncludeMetadata::CorrelationId { .. }
+            | SourceIncludeMetadata::Topic { .. }
+            | SourceIncludeMetadata::TopicLevels { .. }
+            | SourceIncludeMetadata::UserProperties { .. } => None,
         })
         .collect();
     Ok(KafkaSourceConnection {
@@ -1286,6 +1331,178 @@ fn plan_kafka_source_connection(
         group_id_prefix,
         topic_metadata_refresh_interval,
         metadata_columns,
+    })
+}
+
+fn plan_solace_source_connection(
+    scx: &StatementContext<'_>,
+    connection_name: &ResolvedItemName,
+    options: &Vec<ast::SolaceSourceConfigOption<Aug>>,
+    include_metadata: &Vec<SourceIncludeMetadata>,
+) -> Result<SolaceSourceConnection<ReferencedConnection>, PlanError> {
+    let connection_item = scx.get_item_by_resolved_name(connection_name)?;
+    if !matches!(connection_item.connection()?, Connection::Solace(_)) {
+        sql_bail!(
+            "{} is not a Solace connection",
+            scx.catalog.resolve_full_name(connection_item.name())
+        )
+    }
+
+    let crate::solace_util::SolaceSourceConfigOptionExtracted {
+        queue,
+        durable_topic_endpoint,
+        topic_subscription,
+        ack_window_size,
+        flow_max_unacked,
+        deduplicate,
+        parallelism,
+        ack_mode,
+        seen: _,
+    }: crate::solace_util::SolaceSourceConfigOptionExtracted = options.clone().try_into()?;
+
+    // QUEUE vs DURABLE TOPIC ENDPOINT: exactly one of these is required, and
+    // TOPIC SUBSCRIPTION only makes sense paired with a DTE bind.
+    let bind_entity = match (queue, durable_topic_endpoint, topic_subscription.clone()) {
+        (Some(name), None, None) => SolaceBindEntity::Queue { name },
+        (None, Some(name), Some(subscription)) => {
+            SolaceBindEntity::TopicEndpoint { name, subscription }
+        }
+        (Some(_), Some(_), _) => {
+            sql_bail!("QUEUE and DURABLE TOPIC ENDPOINT are mutually exclusive; specify only one")
+        }
+        (None, Some(_), None) => {
+            sql_bail!("DURABLE TOPIC ENDPOINT requires a paired TOPIC SUBSCRIPTION")
+        }
+        (Some(_), None, Some(_)) => {
+            sql_bail!("TOPIC SUBSCRIPTION is only valid with DURABLE TOPIC ENDPOINT, not QUEUE")
+        }
+        (None, None, _) => {
+            sql_bail!("Solace source requires exactly one of QUEUE or DURABLE TOPIC ENDPOINT")
+        }
+    };
+
+    // ACK WINDOW SIZE: positive u32.
+    let ack_window_size = u32::try_from(ack_window_size).map_err(|_| {
+        sql_err!(
+            "ACK WINDOW SIZE must be a positive integer that fits in 32 bits, got {ack_window_size}"
+        )
+    })?;
+    if ack_window_size == 0 {
+        sql_bail!("ACK WINDOW SIZE must be greater than zero");
+    }
+
+    // FLOW MAX UNACKED: i32 (-1 means broker-configured default).
+    let flow_max_unacked = i32::try_from(flow_max_unacked).map_err(|_| {
+        sql_err!("FLOW MAX UNACKED must fit in a signed 32-bit integer, got {flow_max_unacked}")
+    })?;
+    if flow_max_unacked == 0 || flow_max_unacked < -1 {
+        sql_bail!("FLOW MAX UNACKED must be -1 or a positive integer");
+    }
+
+    // PARALLELISM: positive u32; MVP only supports 1.
+    let parallelism = u32::try_from(parallelism).map_err(|_| {
+        sql_err!("PARALLELISM must be a positive integer that fits in 32 bits, got {parallelism}")
+    })?;
+    if parallelism == 0 {
+        sql_bail!("PARALLELISM must be at least 1");
+    }
+    if parallelism > 1 && deduplicate {
+        sql_bail!(
+            "PARALLELISM > 1 on a non-partitioned queue requires DEDUPLICATE = false. \
+             For exactly-once parallelism, use a partitioned queue (Phase 8)."
+        );
+    }
+
+    // ACK MODE: "auto" or "client" (case-insensitive).
+    let auto_ack = match ack_mode.to_ascii_lowercase().as_str() {
+        "auto" => true,
+        "client" => false,
+        other => sql_bail!("ACK MODE must be AUTO or CLIENT, got {other:?}"),
+    };
+
+    // Process INCLUDE metadata, expanding aliases to default names and
+    // rejecting items that aren't valid for Solace sources.
+    let metadata_columns: Vec<(String, SolaceMetadataKind)> = include_metadata
+        .iter()
+        .map(|item| match item {
+            SourceIncludeMetadata::ReplicationGroupMessageId { alias } => {
+                let name = alias.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "rgmid".to_owned());
+                Ok((name, SolaceMetadataKind::ReplicationGroupMessageId))
+            }
+            SourceIncludeMetadata::BrokerTimestamp { alias } => {
+                let name = alias.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "broker_timestamp".to_owned());
+                Ok((name, SolaceMetadataKind::BrokerTimestamp))
+            }
+            SourceIncludeMetadata::SenderTimestamp { alias } => {
+                let name = alias.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "sender_timestamp".to_owned());
+                Ok((name, SolaceMetadataKind::SenderTimestamp))
+            }
+            SourceIncludeMetadata::ApplicationMessageId { alias } => {
+                let name = alias.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "application_message_id".to_owned());
+                Ok((name, SolaceMetadataKind::ApplicationMessageId))
+            }
+            SourceIncludeMetadata::CorrelationId { alias } => {
+                let name = alias.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "correlation_id".to_owned());
+                Ok((name, SolaceMetadataKind::CorrelationId))
+            }
+            SourceIncludeMetadata::Topic { alias } => {
+                let name = alias.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "topic".to_owned());
+                Ok((name, SolaceMetadataKind::Topic))
+            }
+            SourceIncludeMetadata::TopicLevels { prefix, count } => {
+                let prefix = prefix.as_ref().map(|p| p.to_string()).unwrap_or_else(|| "topic_level".to_owned());
+                // Infer count from a concrete subscription (no `*`/`>`); otherwise require explicit COUNT.
+                let resolved_count = match (count, &topic_subscription) {
+                    (Some(c), _) => *c,
+                    (None, Some(sub)) if !sub.contains('*') && !sub.contains('>') => {
+                        let n = sub.split('/').count();
+                        u32::try_from(n).map_err(|_| sql_err!(
+                            "TOPIC SUBSCRIPTION '{sub}' has too many levels to infer COUNT"
+                        ))?
+                    }
+                    (None, _) => sql_bail!(
+                        "INCLUDE TOPIC LEVELS requires (COUNT = N) for queue sources or wildcard subscriptions"
+                    ),
+                };
+                if resolved_count == 0 {
+                    sql_bail!("INCLUDE TOPIC LEVELS (COUNT = ...) must be greater than zero");
+                }
+                Ok((prefix, SolaceMetadataKind::TopicLevels { count: resolved_count }))
+            }
+            SourceIncludeMetadata::Partition { alias } => {
+                let name = alias.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "partition".to_owned());
+                Ok((name, SolaceMetadataKind::Partition))
+            }
+            SourceIncludeMetadata::UserProperties { alias } => {
+                let name = alias.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "user_properties".to_owned());
+                Ok((name, SolaceMetadataKind::UserProperties))
+            }
+            // Kafka-specific items are not valid for Solace sources.
+            SourceIncludeMetadata::Key { .. } => {
+                sql_bail!("INCLUDE KEY is not supported for Solace sources; use UPSERT KEY (...) with INCLUDE columns instead")
+            }
+            SourceIncludeMetadata::Timestamp { .. } => {
+                sql_bail!("INCLUDE TIMESTAMP is not supported for Solace sources; use INCLUDE BROKER TIMESTAMP or INCLUDE SENDER TIMESTAMP")
+            }
+            SourceIncludeMetadata::Offset { .. } => {
+                sql_bail!("INCLUDE OFFSET is not supported for Solace sources; the queue is the cursor (use INCLUDE REPLICATION GROUP MESSAGE ID for a per-message identifier)")
+            }
+            SourceIncludeMetadata::Headers { .. } | SourceIncludeMetadata::Header { .. } => {
+                sql_bail!("INCLUDE HEADERS is not supported for Solace sources; use INCLUDE USER PROPERTIES")
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(SolaceSourceConnection {
+        connection: connection_item.id(),
+        connection_id: connection_item.id(),
+        bind_entity,
+        metadata_columns,
+        ack_window_size,
+        flow_max_unacked,
+        deduplicate,
+        parallelism,
+        auto_ack,
     })
 }
 
@@ -1413,8 +1630,48 @@ fn apply_source_envelope_encoding(
             }
         }
         ast::SourceEnvelope::Upsert {
+            key_columns,
             value_decode_err_policy,
         } => {
+            // MetadataKey path: key comes from INCLUDE metadata columns (e.g. TOPIC LEVELS).
+            // Bypasses the key/value encoding requirement since Solace FORMAT JSON has no
+            // native message key field — the GUFI lives in the topic, not the payload.
+            if !key_columns.is_empty() {
+                let key_col_names: Vec<ColumnName> = key_columns
+                    .iter()
+                    .map(|c| normalize::column_name(c.clone()))
+                    .collect();
+
+                let metadata_desc = included_column_desc(metadata_columns_desc);
+                let value_arity = value_desc.arity();
+                let full_desc = value_desc.concat(metadata_desc.clone());
+
+                let mut key_metadata_indices = Vec::with_capacity(key_col_names.len());
+                let mut key_indices = Vec::with_capacity(key_col_names.len());
+                for name in &key_col_names {
+                    let (meta_idx, _) = metadata_desc.get_by_name(name).ok_or_else(|| {
+                        sql_err!(
+                            "key column '{}' not found in source metadata; \
+                             ENVELOPE UPSERT (KEY (...)) requires columns from INCLUDE TOPIC LEVELS \
+                             or another INCLUDE metadata clause",
+                            name
+                        )
+                    })?;
+                    key_metadata_indices.push(meta_idx);
+                    key_indices.push(value_arity + meta_idx);
+                }
+
+                let source_arity = full_desc.arity();
+                let desc = full_desc.with_key(key_indices.clone());
+                let envelope = SourceEnvelope::Upsert(UpsertEnvelope {
+                    style: UpsertStyle::MetadataKey { key_metadata_indices },
+                    key_indices,
+                    source_arity,
+                });
+                return Ok((desc, envelope, encoding));
+            }
+
+            // Existing path: key must come from a separate key encoding or INCLUDE KEY.
             let key_encoding = match encoding.as_ref().and_then(|e| e.key.as_ref()) {
                 None => {
                     if !key_envelope_no_encoding {
@@ -1694,6 +1951,9 @@ pub fn plan_create_subsource(
             SourceExportStatementDetails::Kafka {} => {
                 bail_unsupported!("subsources cannot reference Kafka sources")
             }
+            SourceExportStatementDetails::Solace {} => {
+                bail_unsupported!("subsources cannot reference Solace sources")
+            }
         };
         DataSourceDesc::IngestionExport {
             ingestion_id,
@@ -1803,6 +2063,7 @@ pub fn plan_create_table_from_source(
         details,
         SourceExportStatementDetails::Kafka { .. }
             | SourceExportStatementDetails::LoadGenerator { .. }
+            | SourceExportStatementDetails::Solace {}
     ) && !include_metadata.is_empty()
     {
         bail_unsupported!("INCLUDE metadata with non-Kafka source table");
@@ -1909,10 +2170,27 @@ pub fn plan_create_table_from_source(
                         // handled below
                         None
                     }
+                    // Solace-specific INCLUDE items are not valid on Kafka
+                    // source tables; the parser accepts the shared grammar,
+                    // but they are silently dropped here (same as Key) and
+                    // surface as a planner error via the empty result if no
+                    // valid Kafka metadata was included.
+                    SourceIncludeMetadata::ReplicationGroupMessageId { .. }
+                    | SourceIncludeMetadata::BrokerTimestamp { .. }
+                    | SourceIncludeMetadata::SenderTimestamp { .. }
+                    | SourceIncludeMetadata::ApplicationMessageId { .. }
+                    | SourceIncludeMetadata::CorrelationId { .. }
+                    | SourceIncludeMetadata::Topic { .. }
+                    | SourceIncludeMetadata::TopicLevels { .. }
+                    | SourceIncludeMetadata::UserProperties { .. } => None,
                 })
                 .collect();
 
             SourceExportDetails::Kafka(KafkaSourceExportDetails { metadata_columns })
+        }
+        SourceExportStatementDetails::Solace {} => {
+            // Phase 2 will route Solace metadata columns through here.
+            bail_unsupported!("source tables cannot reference Solace sources")
         }
     };
 
@@ -1939,10 +2217,18 @@ pub fn plan_create_table_from_source(
             (Some(key_desc), value_desc)
         };
 
-    let metadata_columns_desc = match &details {
+    let _solace_owned_metadata_tbl: Vec<(String, SqlColumnType)>;
+    let metadata_columns_desc: Vec<(&str, SqlColumnType)> = match &details {
         SourceExportDetails::Kafka(KafkaSourceExportDetails {
             metadata_columns, ..
         }) => kafka_metadata_columns_desc(metadata_columns),
+        SourceExportDetails::Solace(SolaceSourceExportDetails { metadata_columns }) => {
+            _solace_owned_metadata_tbl = solace_metadata_columns_desc(metadata_columns);
+            _solace_owned_metadata_tbl
+                .iter()
+                .map(|(s, t)| (s.as_str(), t.clone()))
+                .collect()
+        }
         _ => vec![],
     };
 
@@ -2258,10 +2544,13 @@ fn get_encoding(
         }
     };
 
-    let requires_keyvalue = matches!(
-        envelope,
-        ast::SourceEnvelope::Debezium | ast::SourceEnvelope::Upsert { .. }
-    );
+    let requires_keyvalue = match envelope {
+        ast::SourceEnvelope::Debezium => true,
+        // MetadataKey sources supply the key from INCLUDE metadata columns, not a separate
+        // key encoding. Skip the key-format requirement when key_columns is non-empty.
+        ast::SourceEnvelope::Upsert { key_columns, .. } => key_columns.is_empty(),
+        _ => false,
+    };
     let is_keyvalue = encoding.key.is_some();
     if requires_keyvalue && !is_keyvalue {
         sql_bail!("ENVELOPE [DEBEZIUM] UPSERT requires that KEY FORMAT be specified");
@@ -3263,6 +3552,14 @@ fn plan_sink(
         (CreateSinkConnection::Iceberg { .. }, Some(_), _) => {
             sql_bail!("ENVELOPE is not supported for Iceberg sinks, use MODE instead")
         }
+        // Solace sinks are append-only (publish on mz_diff > 0, ignore retractions)
+        (CreateSinkConnection::Solace { .. }, None, None) => SinkEnvelope::Append,
+        (CreateSinkConnection::Solace { .. }, Some(_), _) => {
+            sql_bail!("Solace sinks do not support ENVELOPE; omit the clause")
+        }
+        (CreateSinkConnection::Solace { .. }, _, Some(_)) => {
+            sql_bail!("MODE is not supported for Solace sinks")
+        }
     };
 
     let from_name = &from;
@@ -3414,7 +3711,8 @@ fn plan_sink(
             Some(indices)
         }
         CreateSinkConnection::Kafka { key: None, .. }
-        | CreateSinkConnection::Iceberg { key: None, .. } => None,
+        | CreateSinkConnection::Iceberg { key: None, .. }
+        | CreateSinkConnection::Solace { .. } => None,
     };
 
     if key_indices.is_some() && envelope == SinkEnvelope::Append {
@@ -3536,6 +3834,11 @@ fn plan_sink(
             commit_interval,
             &desc,
         )?,
+        CreateSinkConnection::Solace {
+            connection,
+            options,
+            ..
+        } => solace_sink_builder(scx, connection, options, desc.into_owned())?,
     };
 
     // WITH SNAPSHOT defaults to true
@@ -3766,6 +4069,73 @@ fn iceberg_sink_builder(
         namespace,
         relation_key_indices,
         key_desc_and_indices,
+    }))
+}
+
+fn solace_sink_builder(
+    scx: &StatementContext,
+    connection_name: ResolvedItemName,
+    options: Vec<ast::SolaceSinkConfigOption<Aug>>,
+    value_desc: RelationDesc,
+) -> Result<StorageSinkConnection<ReferencedConnection>, PlanError> {
+    let connection_item = scx.get_item_by_resolved_name(&connection_name)?;
+    if !matches!(connection_item.connection()?, Connection::Solace(_)) {
+        sql_bail!(
+            "{} is not a Solace connection",
+            scx.catalog
+                .resolve_full_name(connection_item.name())
+                .to_string()
+                .quoted()
+        );
+    }
+    let connection_id = connection_item.id();
+
+    let crate::solace_util::SolaceSinkConfigOptionExtracted {
+        topic,
+        dedup_window,
+        seen: _,
+    }: crate::solace_util::SolaceSinkConfigOptionExtracted = options.try_into()?;
+
+    let Some(topic_template) = topic else {
+        sql_bail!("Solace sink must specify TOPIC");
+    };
+
+    // Parse {column_name} placeholders in the topic template and resolve to column indices.
+    let topic_column_indices: Vec<(String, usize)> = {
+        let re = regex::Regex::new(r"\{([^}]+)\}").expect("static regex");
+        re.captures_iter(&topic_template)
+            .map(|cap| {
+                let col_name_str = cap[1].to_string();
+                let col_name = mz_repr::ColumnName::from(col_name_str.clone());
+                let idx = value_desc
+                    .get_by_name(&col_name)
+                    .map(|(i, _)| i)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            "column '{}' referenced in TOPIC template does not exist",
+                            col_name_str
+                        )
+                    })?;
+                Ok((col_name_str, idx))
+            })
+            .collect::<Result<Vec<_>, PlanError>>()?
+    };
+
+    // Parse optional DEDUP WINDOW duration string (e.g. "15s", "60s").
+    let dedup_window = dedup_window
+        .map(|s| {
+            humantime::parse_duration(&s)
+                .map_err(|_| sql_err!("invalid DEDUP WINDOW duration '{}'; expected e.g. '15s'", s))
+        })
+        .transpose()?;
+
+    Ok(StorageSinkConnection::Solace(SolaceSinkConnection {
+        connection_id,
+        connection: connection_id,
+        value_desc,
+        topic: topic_template,
+        topic_column_indices,
+        dedup_window,
     }))
 }
 
@@ -7174,6 +7544,7 @@ pub fn plan_alter_connection(
         Connection::MySql(_) => CreateConnectionType::MySql,
         Connection::SqlServer(_) => CreateConnectionType::SqlServer,
         Connection::IcebergCatalog(_) => CreateConnectionType::IcebergCatalog,
+        Connection::Solace(_) => CreateConnectionType::Solace,
     };
 
     // Collect all options irrespective of action taken on them.

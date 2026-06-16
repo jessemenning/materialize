@@ -2523,24 +2523,32 @@ impl<'a> Parser<'a> {
         } else if self.parse_keyword(DEBEZIUM) {
             SourceEnvelope::Debezium
         } else if self.parse_keyword(UPSERT) {
-            let value_decode_err_policy = if self.consume_token(&Token::LParen) {
-                // We only support the `VALUE DECODING ERRORS` option for now, but if we add another
-                // we should extract this into a helper function.
-                self.expect_keywords(&[VALUE, DECODING, ERRORS])?;
-                let _ = self.consume_token(&Token::Eq);
-                let open_inner = self.consume_token(&Token::LParen);
-                let value_decode_err_policy =
-                    self.parse_comma_separated(Parser::parse_source_error_policy_option)?;
-                if open_inner {
+            let (key_columns, value_decode_err_policy) = if self.consume_token(&Token::LParen) {
+                if self.parse_keyword(KEY) {
+                    // ENVELOPE UPSERT (KEY (col1, col2, ...))
+                    // Key columns come from INCLUDE metadata columns (e.g. TOPIC LEVELS).
+                    let cols = self.parse_parenthesized_column_list(Mandatory)?;
                     self.expect_token(&Token::RParen)?;
+                    (cols, vec![])
+                } else {
+                    // existing: ENVELOPE UPSERT (VALUE DECODING ERRORS = (...))
+                    self.expect_keywords(&[VALUE, DECODING, ERRORS])?;
+                    let _ = self.consume_token(&Token::Eq);
+                    let open_inner = self.consume_token(&Token::LParen);
+                    let value_decode_err_policy =
+                        self.parse_comma_separated(Parser::parse_source_error_policy_option)?;
+                    if open_inner {
+                        self.expect_token(&Token::RParen)?;
+                    }
+                    self.expect_token(&Token::RParen)?;
+                    (vec![], value_decode_err_policy)
                 }
-                self.expect_token(&Token::RParen)?;
-                value_decode_err_policy
             } else {
-                vec![]
+                (vec![], vec![])
             };
 
             SourceEnvelope::Upsert {
+                key_columns,
                 value_decode_err_policy,
             }
         } else if self.parse_keyword(MATERIALIZE) {
@@ -2594,7 +2602,7 @@ impl<'a> Parser<'a> {
             _ => unreachable!(),
         };
         let connection_type = match self.expect_one_of_keywords(&[
-            AWS, GCP, KAFKA, CONFLUENT, POSTGRES, SSH, SQL, MYSQL, ICEBERG,
+            AWS, GCP, KAFKA, CONFLUENT, POSTGRES, SSH, SQL, MYSQL, ICEBERG, SOLACE,
         ])? {
             AWS => {
                 if self.parse_keyword(PRIVATELINK) {
@@ -2626,6 +2634,7 @@ impl<'a> Parser<'a> {
                 self.expect_keyword(CATALOG)?;
                 CreateConnectionType::IcebergCatalog
             }
+            SOLACE => CreateConnectionType::Solace,
             _ => unreachable!(),
         };
         if expect_paren {
@@ -2929,6 +2938,7 @@ impl<'a> Parser<'a> {
                 ENDPOINT,
                 GCP,
                 HOST,
+                MESSAGE,
                 PASSWORD,
                 PORT,
                 PUBLIC,
@@ -2986,6 +2996,10 @@ impl<'a> Parser<'a> {
                     ConnectionOptionName::GcpConnection
                 }
                 HOST => ConnectionOptionName::Host,
+                MESSAGE => {
+                    self.expect_keyword(VPN)?;
+                    ConnectionOptionName::MessageVpn
+                }
                 PASSWORD => ConnectionOptionName::Password,
                 PORT => ConnectionOptionName::Port,
                 PUBLIC => {
@@ -3557,6 +3571,45 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn parse_create_solace_sink(
+        &mut self,
+        name: Option<UnresolvedItemName>,
+        in_cluster: Option<RawClusterName>,
+        from: RawItemName,
+        if_not_exists: bool,
+        connection: CreateSinkConnection<Raw>,
+    ) -> Result<CreateSinkStatement<Raw>, ParserError> {
+        let format = if self.parse_keyword(FORMAT) {
+            Some(FormatSpecifier::Bare(self.parse_format()?))
+        } else {
+            None
+        };
+        let envelope = if self.parse_keyword(ENVELOPE) {
+            Some(self.parse_sink_envelope()?)
+        } else {
+            None
+        };
+        let with_options = if self.parse_keyword(WITH) {
+            self.expect_token(&Token::LParen)?;
+            let options = self.parse_comma_separated(Parser::parse_create_sink_option)?;
+            self.expect_token(&Token::RParen)?;
+            options
+        } else {
+            vec![]
+        };
+        Ok(CreateSinkStatement {
+            name,
+            in_cluster,
+            from,
+            connection,
+            format,
+            envelope,
+            mode: None,
+            if_not_exists,
+            with_options,
+        })
+    }
+
     fn parse_create_sink(&mut self) -> Result<Statement<Raw>, ParserError> {
         self.expect_keyword(SINK)?;
         let if_not_exists = self.parse_if_not_exists()?;
@@ -3590,6 +3643,9 @@ impl<'a> Parser<'a> {
             }
             conn @ CreateSinkConnection::Iceberg { .. } => {
                 self.parse_create_iceberg_sink(name, in_cluster, from, if_not_exists, conn)
+            }
+            conn @ CreateSinkConnection::Solace { .. } => {
+                self.parse_create_solace_sink(name, in_cluster, from, if_not_exists, conn)
             }
         }?;
 
@@ -3625,7 +3681,7 @@ impl<'a> Parser<'a> {
     fn parse_create_source_connection(
         &mut self,
     ) -> Result<CreateSourceConnection<Raw>, ParserError> {
-        match self.expect_one_of_keywords(&[KAFKA, POSTGRES, SQL, MYSQL, LOAD])? {
+        match self.expect_one_of_keywords(&[KAFKA, POSTGRES, SQL, MYSQL, LOAD, SOLACE])? {
             POSTGRES => {
                 self.expect_keyword(CONNECTION)?;
                 let connection = self.parse_raw_name()?;
@@ -3724,8 +3780,69 @@ impl<'a> Parser<'a> {
                 };
                 Ok(CreateSourceConnection::LoadGenerator { generator, options })
             }
+            SOLACE => {
+                self.expect_keyword(CONNECTION)?;
+                let connection = self.parse_raw_name()?;
+
+                let options = if self.consume_token(&Token::LParen) {
+                    let options =
+                        self.parse_comma_separated(Parser::parse_solace_source_config_option)?;
+                    self.expect_token(&Token::RParen)?;
+                    options
+                } else {
+                    vec![]
+                };
+
+                Ok(CreateSourceConnection::Solace {
+                    connection,
+                    options,
+                })
+            }
             _ => unreachable!(),
         }
+    }
+
+    fn parse_solace_source_config_option(
+        &mut self,
+    ) -> Result<SolaceSourceConfigOption<Raw>, ParserError> {
+        let name = match self.expect_one_of_keywords(&[
+            QUEUE,
+            DURABLE,
+            TOPIC,
+            ACK,
+            FLOW,
+            DEDUPLICATE,
+            PARALLELISM,
+        ])? {
+            QUEUE => SolaceSourceConfigOptionName::Queue,
+            DURABLE => {
+                self.expect_keywords(&[TOPIC, ENDPOINT])?;
+                SolaceSourceConfigOptionName::DurableTopicEndpoint
+            }
+            TOPIC => {
+                self.expect_keyword(SUBSCRIPTION)?;
+                SolaceSourceConfigOptionName::TopicSubscription
+            }
+            ACK => {
+                if self.parse_keyword(MODE) {
+                    SolaceSourceConfigOptionName::AckMode
+                } else {
+                    self.expect_keywords(&[WINDOW, SIZE])?;
+                    SolaceSourceConfigOptionName::AckWindowSize
+                }
+            }
+            FLOW => {
+                self.expect_keywords(&[MAX, UNACKED])?;
+                SolaceSourceConfigOptionName::FlowMaxUnacked
+            }
+            DEDUPLICATE => SolaceSourceConfigOptionName::Deduplicate,
+            PARALLELISM => SolaceSourceConfigOptionName::Parallelism,
+            _ => unreachable!(),
+        };
+        Ok(SolaceSourceConfigOption {
+            name,
+            value: self.parse_optional_option_value()?,
+        })
     }
 
     fn parse_pg_connection_option(&mut self) -> Result<PgConfigOption<Raw>, ParserError> {
@@ -4044,13 +4161,52 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn parse_create_solace_sink_connection(
+        &mut self,
+    ) -> Result<CreateSinkConnection<Raw>, ParserError> {
+        self.expect_keyword(CONNECTION)?;
+        let connection = self.parse_raw_name()?;
+
+        let options = if self.consume_token(&Token::LParen) {
+            let options = self.parse_comma_separated(Parser::parse_solace_sink_config_option)?;
+            self.expect_token(&Token::RParen)?;
+            options
+        } else {
+            vec![]
+        };
+
+        Ok(CreateSinkConnection::Solace {
+            connection,
+            options,
+        })
+    }
+
+    fn parse_solace_sink_config_option(
+        &mut self,
+    ) -> Result<SolaceSinkConfigOption<Raw>, ParserError> {
+        let name = match self.expect_one_of_keywords(&[TOPIC, DEDUP])? {
+            TOPIC => SolaceSinkConfigOptionName::Topic,
+            DEDUP => {
+                self.expect_keyword(WINDOW)?;
+                SolaceSinkConfigOptionName::DedupWindow
+            }
+            _ => unreachable!(),
+        };
+        Ok(SolaceSinkConfigOption {
+            name,
+            value: self.parse_optional_option_value()?,
+        })
+    }
+
     fn parse_create_sink_connection(&mut self) -> Result<CreateSinkConnection<Raw>, ParserError> {
-        match self.expect_one_of_keywords(&[KAFKA, ICEBERG])? {
+        // SOLACE branch added by SolaceDev/materialize-solace fork.
+        match self.expect_one_of_keywords(&[KAFKA, ICEBERG, SOLACE])? {
             KAFKA => self.parse_create_kafka_sink_connection(),
             ICEBERG => {
                 self.expect_keyword(CATALOG)?;
                 self.parse_create_iceberg_sink_connection()
             }
+            SOLACE => self.parse_create_solace_sink_connection(),
             _ => unreachable!(),
         }
     }
@@ -4799,9 +4955,21 @@ impl<'a> Parser<'a> {
     fn parse_source_include_metadata(&mut self) -> Result<Vec<SourceIncludeMetadata>, ParserError> {
         if self.parse_keyword(INCLUDE) {
             self.parse_comma_separated(|parser| {
-                let metadata = match parser
-                    .expect_one_of_keywords(&[KEY, TIMESTAMP, PARTITION, OFFSET, HEADERS, HEADER])?
-                {
+                let metadata = match parser.expect_one_of_keywords(&[
+                    KEY,
+                    TIMESTAMP,
+                    PARTITION,
+                    OFFSET,
+                    HEADERS,
+                    HEADER,
+                    REPLICATION,
+                    BROKER,
+                    SENDER,
+                    APPLICATION,
+                    CORRELATION,
+                    TOPIC,
+                    USER,
+                ])? {
                     KEY => SourceIncludeMetadata::Key {
                         alias: parser.parse_alias()?,
                     },
@@ -4826,6 +4994,68 @@ impl<'a> Parser<'a> {
                             alias,
                             key,
                             use_bytes,
+                        }
+                    }
+                    REPLICATION => {
+                        parser.expect_keywords(&[GROUP, MESSAGE, ID])?;
+                        SourceIncludeMetadata::ReplicationGroupMessageId {
+                            alias: parser.parse_alias()?,
+                        }
+                    }
+                    BROKER => {
+                        parser.expect_keyword(TIMESTAMP)?;
+                        SourceIncludeMetadata::BrokerTimestamp {
+                            alias: parser.parse_alias()?,
+                        }
+                    }
+                    SENDER => {
+                        parser.expect_keyword(TIMESTAMP)?;
+                        SourceIncludeMetadata::SenderTimestamp {
+                            alias: parser.parse_alias()?,
+                        }
+                    }
+                    APPLICATION => {
+                        parser.expect_keywords(&[MESSAGE, ID])?;
+                        SourceIncludeMetadata::ApplicationMessageId {
+                            alias: parser.parse_alias()?,
+                        }
+                    }
+                    CORRELATION => {
+                        parser.expect_keyword(ID)?;
+                        SourceIncludeMetadata::CorrelationId {
+                            alias: parser.parse_alias()?,
+                        }
+                    }
+                    TOPIC => {
+                        if parser.parse_keyword(LEVELS) {
+                            // Optional `(COUNT = <int>)` parenthesized options.
+                            let count = if parser.consume_token(&Token::LParen) {
+                                parser.expect_keywords(&[COUNT])?;
+                                parser.expect_token(&Token::Eq)?;
+                                let n: u64 = parser.parse_literal_uint()?;
+                                let n: u32 = n.try_into().map_err(|_| {
+                                    ParserError::new(
+                                        parser.peek_prev_pos(),
+                                        "TOPIC LEVELS COUNT must fit in u32",
+                                    )
+                                })?;
+                                parser.expect_token(&Token::RParen)?;
+                                Some(n)
+                            } else {
+                                None
+                            };
+                            let prefix = parser.parse_alias()?;
+                            SourceIncludeMetadata::TopicLevels { prefix, count }
+                        } else {
+                            SourceIncludeMetadata::Topic {
+                                alias: parser.parse_alias()?,
+                            }
+                        }
+                    }
+                    USER => {
+                        parser.expect_keyword(PROPERTIES)?;
+                        SourceIncludeMetadata::UserProperties {
+                            alias: parser.parse_alias()?,
                         }
                     }
                     _ => unreachable!("only explicitly allowed items can be parsed"),

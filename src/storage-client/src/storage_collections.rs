@@ -1932,9 +1932,9 @@ impl StorageCollections for StorageCollectionsImpl {
                         Ingestion(ingestion) => {
                             use GenericSourceConnection::*;
                             match ingestion.desc.connection {
-                                // Kafka, Postgres, MySql, and SQL Server sources all
-                                // follow wall clock.
-                                Kafka(_) | Postgres(_) | MySql(_) | SqlServer(_) => {
+                                // Kafka, Postgres, MySql, SQL Server, and Solace
+                                // sources all follow wall clock.
+                                Kafka(_) | Postgres(_) | MySql(_) | SqlServer(_) | Solace(_) => {
                                     Some(TimeDependence::default())
                                 }
                                 // Load generators not further specified.

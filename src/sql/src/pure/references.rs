@@ -50,6 +50,12 @@ pub(super) enum SourceReferenceClient<'a> {
     LoadGenerator {
         generator: &'a LoadGenerator,
     },
+    /// A Solace source has no "tables"; the queue (or DTE) is the entire
+    /// upstream. We carry the bind name purely so the catalog can record
+    /// it as the source's external reference.
+    Solace {
+        external_reference: &'a str,
+    },
 }
 
 /// Metadata about an available source reference retrieved from the upstream system.
@@ -72,6 +78,8 @@ pub(super) enum ReferenceMetadata {
         namespace: String,
         output: LoadGeneratorOutput,
     },
+    /// External reference for a Solace source — the queue or DTE name.
+    Solace(String),
 }
 
 impl ReferenceMetadata {
@@ -82,6 +90,7 @@ impl ReferenceMetadata {
             ReferenceMetadata::SqlServer { table, .. } => Some(table.schema_name.as_ref()),
             ReferenceMetadata::Kafka(_) => None,
             ReferenceMetadata::LoadGenerator { namespace, .. } => Some(namespace),
+            ReferenceMetadata::Solace(_) => None,
         }
     }
 
@@ -92,6 +101,7 @@ impl ReferenceMetadata {
             ReferenceMetadata::SqlServer { table, .. } => table.name.as_ref(),
             ReferenceMetadata::Kafka(topic) => topic,
             ReferenceMetadata::LoadGenerator { name, .. } => name,
+            ReferenceMetadata::Solace(name) => name,
         }
     }
 
@@ -166,6 +176,9 @@ impl ReferenceMetadata {
             ])),
             ReferenceMetadata::Kafka(topic) => {
                 Ok(UnresolvedItemName::qualified(&[Ident::new(topic)?]))
+            }
+            ReferenceMetadata::Solace(name) => {
+                Ok(UnresolvedItemName::qualified(&[Ident::new(name)?]))
             }
             ReferenceMetadata::LoadGenerator {
                 name, namespace, ..
@@ -308,6 +321,9 @@ impl<'a> SourceReferenceClient<'a> {
             SourceReferenceClient::Kafka { topic } => {
                 vec![ReferenceMetadata::Kafka(topic.to_string())]
             }
+            SourceReferenceClient::Solace { external_reference } => {
+                vec![ReferenceMetadata::Solace(external_reference.to_string())]
+            }
             SourceReferenceClient::LoadGenerator { generator } => {
                 let mut references = generator
                     .views()
@@ -411,6 +427,11 @@ impl RetrievedSourceReferences {
                     },
                     ReferenceMetadata::Kafka(topic) => SourceReference {
                         name: topic,
+                        namespace: None,
+                        columns: vec![],
+                    },
+                    ReferenceMetadata::Solace(name) => SourceReference {
+                        name,
                         namespace: None,
                         columns: vec![],
                     },

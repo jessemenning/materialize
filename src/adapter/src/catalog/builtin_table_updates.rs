@@ -715,7 +715,8 @@ impl CatalogState {
             | ConnectionDetails::Postgres(_)
             | ConnectionDetails::MySql(_)
             | ConnectionDetails::SqlServer(_)
-            | ConnectionDetails::IcebergCatalog(_) => (),
+            | ConnectionDetails::IcebergCatalog(_)
+            | ConnectionDetails::Solace(_) => (),
         };
         updates
     }
@@ -1019,6 +1020,7 @@ impl CatalogState {
                     diff,
                 ));
             }
+            StorageSinkConnection::Solace(_) => {}
         };
 
         let create_stmt = mz_sql::parse::parse(&sink.create_sql)

@@ -322,4 +322,8 @@ unknown-registry = "deny"
 # remain buildable even if upstream Git repositories disappear. If you don't
 # have permissions to create a fork in the MaterializeInc organization, ask in
 # #eng-infra on Slack.
-allow-org = { github = ["MaterializeInc"] }
+#
+# `jessemenning` is allowlisted for the Solace source connector work — the
+# `solace-rs` fork (jessemenning/solace-rs) holds the v0.9.1 tag the storage
+# runtime depends on. Move to MaterializeInc once the source lands upstream.
+allow-org = { github = ["MaterializeInc", "jessemenning"] }

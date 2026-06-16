@@ -432,8 +432,9 @@ fn rewrite_sources_to_tables(
                     }
                 });
             }
-            CreateSourceConnection::Kafka { .. } | CreateSourceConnection::LoadGenerator { .. } => {
-            }
+            CreateSourceConnection::Kafka { .. }
+            | CreateSourceConnection::LoadGenerator { .. }
+            | CreateSourceConnection::Solace { .. } => {}
         }
 
         // Then, figure out the new statements for the progress and source.
@@ -659,6 +660,11 @@ fn rewrite_sources_to_tables(
                         full_source_name.item,
                         new_source_stmt,
                     )
+                }
+                CreateSourceConnection::Solace { .. } => {
+                    // Solace sources were added after the ast_rewrite_sources_to_tables
+                    // migration; no Solace source can exist in old syntax.
+                    unreachable!("Solace sources have no old-syntax form to migrate from")
                 }
             };
 

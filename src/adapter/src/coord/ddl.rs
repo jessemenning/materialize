@@ -1141,7 +1141,8 @@ impl Coordinator {
                             | ConnectionDetails::Ssh { .. }
                             | ConnectionDetails::Aws(_)
                             | ConnectionDetails::Gcp(_)
-                            | ConnectionDetails::IcebergCatalog(_) => {}
+                            | ConnectionDetails::IcebergCatalog(_)
+                            | ConnectionDetails::Solace(_) => {}
                         },
                         CatalogItem::Table(_) => {
                             new_tables += 1;
@@ -1319,7 +1320,8 @@ impl Coordinator {
                 | ConnectionDetails::Ssh { .. }
                 | ConnectionDetails::Aws(_)
                 | ConnectionDetails::Gcp(_)
-                | ConnectionDetails::IcebergCatalog(_) => {}
+                | ConnectionDetails::IcebergCatalog(_)
+                | ConnectionDetails::Solace(_) => {}
             }
         }
         self.validate_resource_limit(

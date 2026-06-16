@@ -68,6 +68,7 @@ pub mod kafka;
 pub mod load_generator;
 pub mod mysql;
 pub mod postgres;
+pub mod solace;
 pub mod sql_server;
 
 pub use crate::sources::envelope::SourceEnvelope;
@@ -75,6 +76,7 @@ pub use crate::sources::kafka::KafkaSourceConnection;
 pub use crate::sources::load_generator::LoadGeneratorSourceConnection;
 pub use crate::sources::mysql::{MySqlSourceConnection, MySqlSourceExportDetails};
 pub use crate::sources::postgres::{PostgresSourceConnection, PostgresSourceExportDetails};
+pub use crate::sources::solace::{SolaceSourceConnection, SolaceSourceExportDetails};
 pub use crate::sources::sql_server::{SqlServerSourceConnection, SqlServerSourceExtras};
 
 include!(concat!(env!("OUT_DIR"), "/mz_storage_types.sources.rs"));
@@ -624,6 +626,9 @@ impl<C: ConnectionAccess> SourceExportDataConfig<C> {
                     GenericSourceConnection::LoadGenerator(g) => g.load_generator.is_monotonic(),
                     // Kafka exports with `None` envelope are append-only.
                     GenericSourceConnection::Kafka(_) => true,
+                    // Solace exports with `None` envelope are append-only;
+                    // guaranteed-messaging streams produce only inserts.
+                    GenericSourceConnection::Solace(_) => true,
                 }
             }
         }
@@ -695,6 +700,7 @@ pub enum GenericSourceConnection<C: ConnectionAccess = InlinedConnection> {
     MySql(MySqlSourceConnection<C>),
     SqlServer(SqlServerSourceConnection<C>),
     LoadGenerator(LoadGeneratorSourceConnection),
+    Solace(SolaceSourceConnection<C>),
 }
 
 impl<C: ConnectionAccess> From<KafkaSourceConnection<C>> for GenericSourceConnection<C> {
@@ -727,6 +733,12 @@ impl<C: ConnectionAccess> From<LoadGeneratorSourceConnection> for GenericSourceC
     }
 }
 
+impl<C: ConnectionAccess> From<SolaceSourceConnection<C>> for GenericSourceConnection<C> {
+    fn from(conn: SolaceSourceConnection<C>) -> Self {
+        Self::Solace(conn)
+    }
+}
+
 impl<R: ConnectionResolver> IntoInlineConnection<GenericSourceConnection, R>
     for GenericSourceConnection<ReferencedConnection>
 {
@@ -747,6 +759,9 @@ impl<R: ConnectionResolver> IntoInlineConnection<GenericSourceConnection, R>
             GenericSourceConnection::LoadGenerator(lg) => {
                 GenericSourceConnection::LoadGenerator(lg)
             }
+            GenericSourceConnection::Solace(solace) => {
+                GenericSourceConnection::Solace(solace.into_inline_connection(r))
+            }
         }
     }
 }
@@ -759,6 +774,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
             Self::MySql(conn) => conn.name(),
             Self::SqlServer(conn) => conn.name(),
             Self::LoadGenerator(conn) => conn.name(),
+            Self::Solace(conn) => conn.name(),
         }
     }
 
@@ -769,6 +785,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
             Self::MySql(conn) => conn.external_reference(),
             Self::SqlServer(conn) => conn.external_reference(),
             Self::LoadGenerator(conn) => conn.external_reference(),
+            Self::Solace(conn) => conn.external_reference(),
         }
     }
 
@@ -779,6 +796,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
             Self::MySql(conn) => conn.default_key_desc(),
             Self::SqlServer(conn) => conn.default_key_desc(),
             Self::LoadGenerator(conn) => conn.default_key_desc(),
+            Self::Solace(conn) => conn.default_key_desc(),
         }
     }
 
@@ -789,6 +807,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
             Self::MySql(conn) => conn.default_value_desc(),
             Self::SqlServer(conn) => conn.default_value_desc(),
             Self::LoadGenerator(conn) => conn.default_value_desc(),
+            Self::Solace(conn) => conn.default_value_desc(),
         }
     }
 
@@ -799,6 +818,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
             Self::MySql(conn) => conn.timestamp_desc(),
             Self::SqlServer(conn) => conn.timestamp_desc(),
             Self::LoadGenerator(conn) => conn.timestamp_desc(),
+            Self::Solace(conn) => conn.timestamp_desc(),
         }
     }
 
@@ -809,6 +829,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
             Self::MySql(conn) => conn.connection_id(),
             Self::SqlServer(conn) => conn.connection_id(),
             Self::LoadGenerator(conn) => conn.connection_id(),
+            Self::Solace(conn) => conn.connection_id(),
         }
     }
 
@@ -819,6 +840,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
             GenericSourceConnection::MySql(conn) => conn.supports_read_only(),
             GenericSourceConnection::SqlServer(conn) => conn.supports_read_only(),
             GenericSourceConnection::LoadGenerator(conn) => conn.supports_read_only(),
+            GenericSourceConnection::Solace(conn) => conn.supports_read_only(),
         }
     }
 
@@ -829,6 +851,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
             GenericSourceConnection::MySql(conn) => conn.prefers_single_replica(),
             GenericSourceConnection::SqlServer(conn) => conn.prefers_single_replica(),
             GenericSourceConnection::LoadGenerator(conn) => conn.prefers_single_replica(),
+            GenericSourceConnection::Solace(conn) => conn.prefers_single_replica(),
         }
     }
 }
@@ -845,6 +868,7 @@ impl<C: ConnectionAccess> crate::AlterCompatible for GenericSourceConnection<C> 
             (Self::LoadGenerator(conn), Self::LoadGenerator(other)) => {
                 conn.alter_compatible(id, other)
             }
+            (Self::Solace(conn), Self::Solace(other)) => conn.alter_compatible(id, other),
             _ => Err(AlterError { id }),
         };
 
@@ -872,6 +896,7 @@ pub enum SourceExportDetails {
     MySql(MySqlSourceExportDetails),
     SqlServer(SqlServerSourceExportDetails),
     LoadGenerator(LoadGeneratorSourceExportDetails),
+    Solace(SolaceSourceExportDetails),
 }
 
 impl crate::AlterCompatible for SourceExportDetails {
@@ -886,6 +911,7 @@ impl crate::AlterCompatible for SourceExportDetails {
             (Self::MySql(s), Self::MySql(o)) => s.alter_compatible(id, o),
             (Self::SqlServer(s), Self::SqlServer(o)) => s.alter_compatible(id, o),
             (Self::LoadGenerator(s), Self::LoadGenerator(o)) => s.alter_compatible(id, o),
+            (Self::Solace(s), Self::Solace(o)) => s.alter_compatible(id, o),
             _ => Err(AlterError { id }),
         };
 
@@ -924,6 +950,7 @@ pub enum SourceExportStatementDetails {
         output: LoadGeneratorOutput,
     },
     Kafka {},
+    Solace {},
 }
 
 impl RustType<ProtoSourceExportStatementDetails> for SourceExportStatementDetails {
@@ -976,6 +1003,11 @@ impl RustType<ProtoSourceExportStatementDetails> for SourceExportStatementDetail
                     kafka::ProtoKafkaSourceExportStatementDetails {},
                 )),
             },
+            SourceExportStatementDetails::Solace {} => ProtoSourceExportStatementDetails {
+                kind: Some(proto_source_export_statement_details::Kind::Solace(
+                    solace::ProtoSolaceSourceExportStatementDetails {},
+                )),
+            },
         }
     }
 
@@ -1009,6 +1041,7 @@ impl RustType<ProtoSourceExportStatementDetails> for SourceExportStatementDetail
                     .into_rust_if_some("ProtoLoadGeneratorSourceExportStatementDetails::output")?,
             },
             Some(Kind::Kafka(_details)) => SourceExportStatementDetails::Kafka {},
+            Some(Kind::Solace(_details)) => SourceExportStatementDetails::Solace {},
             None => {
                 return Err(TryFromProtoError::missing_field(
                     "ProtoSourceExportStatementDetails::kind",

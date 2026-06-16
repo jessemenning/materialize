@@ -111,6 +111,13 @@ pub(super) async fn real_time_recency_ts(
             "do not try to determine RTR timestamp on {} source",
             s.name()
         ),
+        // Solace RTR wiring lands alongside the Solace ingestion runtime
+        // in Phase 3; until then the caller-side filter at
+        // storage-controller/src/lib.rs skips Solace before reaching here.
+        s @ GenericSourceConnection::Solace(_) => unreachable!(
+            "do not try to determine RTR timestamp on {} source",
+            s.name()
+        ),
     }
 }
 

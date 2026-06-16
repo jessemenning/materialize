@@ -191,7 +191,23 @@ where
 
     let mut tokens = vec![];
 
-    let (probed_upper_tx, probed_upper_rx) = watch::channel(None);
+    // Seed the remap watch channel with a synthetic probe at logical time "now"
+    // and upstream frontier = minimum. Without this, the remap operator blocks
+    // on `probed_upper.wait_for(Some(_))` until the source emits its first real
+    // probe through the Timely dataflow — which takes several scheduling cycles
+    // after the source connects. Any SELECT issued during that window (including
+    // schema_ok checks in faa-init and populate_view_registry in stream-proxy)
+    // hangs indefinitely.
+    //
+    // The synthetic binding says: "as of startup time T, the source frontier is
+    // at minimum (no data yet)." This allows queries to proceed immediately with
+    // an empty result rather than waiting. Real probes from the source override
+    // this as soon as they arrive.
+    let startup_probe = Probe::<C::Time> {
+        probe_ts: (config.now_fn)().into(),
+        upstream_frontier: Antichain::from_elem(<C::Time as Timestamp>::minimum()),
+    };
+    let (probed_upper_tx, probed_upper_rx) = watch::channel(Some(startup_probe));
 
     let source_metrics = Arc::new(config.metrics.get_source_metrics(id, worker_id));
 

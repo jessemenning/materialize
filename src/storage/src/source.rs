@@ -36,6 +36,7 @@ pub mod generator;
 mod kafka;
 mod mysql;
 mod postgres;
+mod solace;
 mod sql_server;
 
 pub use kafka::KafkaSourceReader;

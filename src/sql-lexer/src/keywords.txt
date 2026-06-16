@@ -26,6 +26,7 @@
 Abort
 Access
 Account
+Ack
 Action
 Add
 Added
@@ -43,6 +44,7 @@ Analyze
 And
 Any
 Append
+Application
 Apply
 Arity
 Arn
@@ -110,6 +112,7 @@ Connection
 Connections
 Constraint
 Copy
+Correlation
 Count
 Counter
 Cpu
@@ -139,6 +142,8 @@ Decimal
 Declare
 Decoding
 Decorrelated
+Dedup
+Deduplicate
 Default
 Defaults
 Delete
@@ -155,6 +160,7 @@ Doc
 Dot
 Double
 Drop
+Durable
 Eager
 Element
 Else
@@ -191,6 +197,7 @@ Filter
 First
 Fixpoint
 Float
+Flow
 Following
 For
 Foreign
@@ -266,6 +273,7 @@ Left
 Legacy
 Letrec
 Level
+Levels
 Like
 Limit
 Linear
@@ -343,6 +351,7 @@ Outer
 Over
 Owned
 Owner
+Parallelism
 Partition
 Partitions
 Password
@@ -366,6 +375,7 @@ Privatelink
 Privileges
 Progress
 Projection
+Properties
 Protobuf
 Protocol
 Public
@@ -373,6 +383,7 @@ Publication
 Pushdown
 Qualify
 Query
+Queue
 Quote
 Raise
 Range
@@ -431,6 +442,7 @@ Secrets
 Security
 Seed
 Select
+Sender
 Sequences
 Serializable
 Server
@@ -445,6 +457,7 @@ Size
 Skew
 Smallint
 Snapshot
+Solace
 Some
 Source
 Sources
@@ -461,6 +474,7 @@ Strict
 String
 Strong
 Subscribe
+Subscription
 Subsource
 Subsources
 Substring
@@ -498,6 +512,7 @@ True
 Tunnel
 Type
 Types
+Unacked
 Unbounded
 Uncommitted
 Union
@@ -525,6 +540,7 @@ Verbose
 Version
 View
 Views
+Vpn
 Wait
 Warehouse
 Warning

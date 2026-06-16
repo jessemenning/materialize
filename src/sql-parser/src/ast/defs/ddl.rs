@@ -625,6 +625,35 @@ pub enum SourceIncludeMetadata {
         alias: Ident,
         use_bytes: bool,
     },
+    // Solace metadata items.
+    ReplicationGroupMessageId {
+        alias: Option<Ident>,
+    },
+    BrokerTimestamp {
+        alias: Option<Ident>,
+    },
+    SenderTimestamp {
+        alias: Option<Ident>,
+    },
+    ApplicationMessageId {
+        alias: Option<Ident>,
+    },
+    CorrelationId {
+        alias: Option<Ident>,
+    },
+    Topic {
+        alias: Option<Ident>,
+    },
+    /// Decompose the resolved topic on `/` into N `text` columns named
+    /// `<prefix>_1..<prefix>_<count>`. Default prefix is `topic_level`;
+    /// `count` is inferred from a concrete topic subscription when omitted.
+    TopicLevels {
+        prefix: Option<Ident>,
+        count: Option<u32>,
+    },
+    UserProperties {
+        alias: Option<Ident>,
+    },
 }
 
 impl AstDisplay for SourceIncludeMetadata {
@@ -670,6 +699,43 @@ impl AstDisplay for SourceIncludeMetadata {
                     f.write_str(" BYTES");
                 }
             }
+            SourceIncludeMetadata::ReplicationGroupMessageId { alias } => {
+                f.write_str("REPLICATION GROUP MESSAGE ID");
+                print_alias(f, alias);
+            }
+            SourceIncludeMetadata::BrokerTimestamp { alias } => {
+                f.write_str("BROKER TIMESTAMP");
+                print_alias(f, alias);
+            }
+            SourceIncludeMetadata::SenderTimestamp { alias } => {
+                f.write_str("SENDER TIMESTAMP");
+                print_alias(f, alias);
+            }
+            SourceIncludeMetadata::ApplicationMessageId { alias } => {
+                f.write_str("APPLICATION MESSAGE ID");
+                print_alias(f, alias);
+            }
+            SourceIncludeMetadata::CorrelationId { alias } => {
+                f.write_str("CORRELATION ID");
+                print_alias(f, alias);
+            }
+            SourceIncludeMetadata::Topic { alias } => {
+                f.write_str("TOPIC");
+                print_alias(f, alias);
+            }
+            SourceIncludeMetadata::TopicLevels { prefix, count } => {
+                f.write_str("TOPIC LEVELS");
+                if let Some(count) = count {
+                    f.write_str(" (COUNT = ");
+                    f.write_str(&count.to_string());
+                    f.write_str(")");
+                }
+                print_alias(f, prefix);
+            }
+            SourceIncludeMetadata::UserProperties { alias } => {
+                f.write_str("USER PROPERTIES");
+                print_alias(f, alias);
+            }
         }
     }
 }
@@ -703,6 +769,10 @@ pub enum SourceEnvelope {
     None,
     Debezium,
     Upsert {
+        /// Explicit key columns from `ENVELOPE UPSERT (KEY (...))`.
+        /// When non-empty, the key is extracted from INCLUDE metadata columns
+        /// rather than from a separate key encoding. Empty = legacy behaviour.
+        key_columns: Vec<Ident>,
         value_decode_err_policy: Vec<SourceErrorPolicy>,
     },
     CdcV2,
@@ -732,9 +802,14 @@ impl AstDisplay for SourceEnvelope {
                 f.write_str("DEBEZIUM");
             }
             Self::Upsert {
+                key_columns,
                 value_decode_err_policy,
             } => {
-                if value_decode_err_policy.is_empty() {
+                if !key_columns.is_empty() {
+                    f.write_str("UPSERT (KEY (");
+                    f.write_node(&display::comma_separated(key_columns));
+                    f.write_str("))");
+                } else if value_decode_err_policy.is_empty() {
                     f.write_str("UPSERT");
                 } else {
                     f.write_str("UPSERT (VALUE DECODING ERRORS = (");
@@ -878,6 +953,7 @@ pub enum ConnectionOptionName {
     Endpoint,
     GcpConnection,
     Host,
+    MessageVpn,
     Password,
     Port,
     ProgressTopic,
@@ -920,6 +996,7 @@ impl AstDisplay for ConnectionOptionName {
             ConnectionOptionName::Endpoint => "ENDPOINT",
             ConnectionOptionName::GcpConnection => "GCP CONNECTION",
             ConnectionOptionName::Host => "HOST",
+            ConnectionOptionName::MessageVpn => "MESSAGE VPN",
             ConnectionOptionName::Password => "PASSWORD",
             ConnectionOptionName::Port => "PORT",
             ConnectionOptionName::ProgressTopic => "PROGRESS TOPIC",
@@ -974,6 +1051,7 @@ impl WithOptionName for ConnectionOptionName {
             | ConnectionOptionName::Endpoint
             | ConnectionOptionName::GcpConnection
             | ConnectionOptionName::Host
+            | ConnectionOptionName::MessageVpn
             | ConnectionOptionName::Password
             | ConnectionOptionName::Port
             | ConnectionOptionName::ProgressTopic
@@ -1028,6 +1106,7 @@ pub enum CreateConnectionType {
     SqlServer,
     MySql,
     IcebergCatalog,
+    Solace,
 }
 
 impl CreateConnectionType {
@@ -1044,6 +1123,7 @@ impl CreateConnectionType {
             Self::MySql => "mysql",
             Self::SqlServer => "sql-server",
             Self::IcebergCatalog => "iceberg-catalog",
+            Self::Solace => "solace",
         }
     }
 }
@@ -1083,6 +1163,9 @@ impl AstDisplay for CreateConnectionType {
             }
             Self::IcebergCatalog => {
                 f.write_str("ICEBERG CATALOG");
+            }
+            Self::Solace => {
+                f.write_str("SOLACE");
             }
         }
     }
@@ -1173,6 +1256,72 @@ pub struct KafkaSourceConfigOption<T: AstInfo> {
 }
 impl_display_for_with_option!(KafkaSourceConfigOption);
 impl_display_t!(KafkaSourceConfigOption);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SolaceSourceConfigOptionName {
+    /// `QUEUE '<name>'` — bind to an existing durable queue.
+    Queue,
+    /// `DURABLE TOPIC ENDPOINT '<name>'` — bind to an existing DTE.
+    DurableTopicEndpoint,
+    /// `TOPIC SUBSCRIPTION '<pattern>'` — subscription to apply on a DTE bind.
+    TopicSubscription,
+    /// `ACK WINDOW SIZE <int>` — Solace flow window size.
+    AckWindowSize,
+    /// `FLOW MAX UNACKED <int>` — broker-side maximum unacked messages.
+    FlowMaxUnacked,
+    /// `DEDUPLICATE <bool>` — exactly-once via RGMID watermark when true.
+    Deduplicate,
+    /// `PARALLELISM <int>` — number of consumer workers.
+    Parallelism,
+    /// `ACK MODE = AUTO | CLIENT` — flow ack mode. AUTO acks on delivery
+    /// (at-most-once, maximum throughput); CLIENT acks after persist-commit
+    /// (exactly-once). Defaults to CLIENT.
+    AckMode,
+}
+
+impl AstDisplay for SolaceSourceConfigOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str(match self {
+            SolaceSourceConfigOptionName::Queue => "QUEUE",
+            SolaceSourceConfigOptionName::DurableTopicEndpoint => "DURABLE TOPIC ENDPOINT",
+            SolaceSourceConfigOptionName::TopicSubscription => "TOPIC SUBSCRIPTION",
+            SolaceSourceConfigOptionName::AckWindowSize => "ACK WINDOW SIZE",
+            SolaceSourceConfigOptionName::FlowMaxUnacked => "FLOW MAX UNACKED",
+            SolaceSourceConfigOptionName::Deduplicate => "DEDUPLICATE",
+            SolaceSourceConfigOptionName::Parallelism => "PARALLELISM",
+            SolaceSourceConfigOptionName::AckMode => "ACK MODE",
+        })
+    }
+}
+impl_display!(SolaceSourceConfigOptionName);
+
+impl WithOptionName for SolaceSourceConfigOptionName {
+    /// # WARNING
+    ///
+    /// Whenever implementing this trait consider very carefully whether or not
+    /// this value could contain sensitive user data. If you're uncertain, err
+    /// on the conservative side and return `true`.
+    fn redact_value(&self) -> bool {
+        match self {
+            SolaceSourceConfigOptionName::Queue
+            | SolaceSourceConfigOptionName::DurableTopicEndpoint
+            | SolaceSourceConfigOptionName::TopicSubscription
+            | SolaceSourceConfigOptionName::AckWindowSize
+            | SolaceSourceConfigOptionName::FlowMaxUnacked
+            | SolaceSourceConfigOptionName::Deduplicate
+            | SolaceSourceConfigOptionName::Parallelism
+            | SolaceSourceConfigOptionName::AckMode => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SolaceSourceConfigOption<T: AstInfo> {
+    pub name: SolaceSourceConfigOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(SolaceSourceConfigOption);
+impl_display_t!(SolaceSourceConfigOption);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum KafkaSinkConfigOptionName {
@@ -1471,6 +1620,10 @@ pub enum CreateSourceConnection<T: AstInfo> {
         generator: LoadGenerator,
         options: Vec<LoadGeneratorOption<T>>,
     },
+    Solace {
+        connection: T::ItemName,
+        options: Vec<SolaceSourceConfigOption<T>>,
+    },
 }
 
 impl<T: AstInfo> AstDisplay for CreateSourceConnection<T> {
@@ -1527,6 +1680,18 @@ impl<T: AstInfo> AstDisplay for CreateSourceConnection<T> {
             CreateSourceConnection::LoadGenerator { generator, options } => {
                 f.write_str("LOAD GENERATOR ");
                 f.write_node(generator);
+                if !options.is_empty() {
+                    f.write_str(" (");
+                    f.write_node(&display::comma_separated(options));
+                    f.write_str(")");
+                }
+            }
+            CreateSourceConnection::Solace {
+                connection,
+                options,
+            } => {
+                f.write_str("SOLACE CONNECTION ");
+                f.write_node(connection);
                 if !options.is_empty() {
                     f.write_str(" (");
                     f.write_node(&display::comma_separated(options));
@@ -1668,7 +1833,37 @@ pub enum CreateSinkConnection<T: AstInfo> {
         key: Option<SinkKey>,
         options: Vec<IcebergSinkConfigOption<T>>,
     },
+    Solace {
+        connection: T::ItemName,
+        options: Vec<SolaceSinkConfigOption<T>>,
+    },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SolaceSinkConfigOptionName {
+    Topic,
+    DedupWindow,
+}
+
+impl AstDisplay for SolaceSinkConfigOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str(match self {
+            SolaceSinkConfigOptionName::Topic => "TOPIC",
+            SolaceSinkConfigOptionName::DedupWindow => "DEDUP WINDOW",
+        })
+    }
+}
+impl_display!(SolaceSinkConfigOptionName);
+
+impl WithOptionName for SolaceSinkConfigOptionName {}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SolaceSinkConfigOption<T: AstInfo> {
+    pub name: SolaceSinkConfigOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+impl_display_for_with_option!(SolaceSinkConfigOption);
+impl_display_t!(SolaceSinkConfigOption);
 
 impl<T: AstInfo> AstDisplay for CreateSinkConnection<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
@@ -1715,6 +1910,18 @@ impl<T: AstInfo> AstDisplay for CreateSinkConnection<T> {
                 if let Some(key) = key.as_ref() {
                     f.write_str(" ");
                     f.write_node(key);
+                }
+            }
+            CreateSinkConnection::Solace {
+                connection,
+                options,
+            } => {
+                f.write_str("SOLACE CONNECTION ");
+                f.write_node(connection);
+                if !options.is_empty() {
+                    f.write_str(" (");
+                    f.write_node(&display::comma_separated(options));
+                    f.write_str(")");
                 }
             }
         }

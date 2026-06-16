@@ -630,6 +630,8 @@ async fn purify_create_sink(
                 .await
                 .map_err(|e| IcebergSinkPurificationError::CatalogError(Arc::new(e)))?;
         }
+        // Solace sinks require no async purification step.
+        CreateSinkConnection::Solace { .. } => {}
     }
 
     let mut csr_connection_ids = BTreeSet::new();
@@ -765,6 +767,9 @@ async fn purify_create_source(
         }
         CreateSourceConnection::LoadGenerator { .. } => {
             &mz_storage_types::sources::load_generator::LOAD_GEN_PROGRESS_DESC
+        }
+        CreateSourceConnection::Solace { .. } => {
+            &mz_storage_types::sources::solace::SOLACE_PROGRESS_DESC
         }
     };
     let scx = StatementContext::new(None, &catalog);
@@ -1264,6 +1269,25 @@ async fn purify_create_source(
                 }
             }
         }
+        CreateSourceConnection::Solace { options, .. } => {
+            // Solace sources do not enumerate references (no subsource fan-out).
+            // The queue or DTE bind is the entire upstream.
+            if let Some(external_references) = external_references {
+                sql_bail!(
+                    "Solace sources do not support FOR ALL TABLES / FOR TABLES syntax: {external_references}"
+                );
+            }
+            let extracted: crate::solace_util::SolaceSourceConfigOptionExtracted =
+                options.clone().try_into()?;
+            let external_reference = extracted
+                .queue
+                .or(extracted.durable_topic_endpoint)
+                .unwrap_or_else(|| "<unspecified>".to_owned());
+            let reference_client = SourceReferenceClient::Solace {
+                external_reference: &external_reference,
+            };
+            retrieved_source_references = reference_client.get_source_references().await?;
+        }
     }
 
     // Now that we know which subsources to create alongside this
@@ -1749,6 +1773,9 @@ async fn purify_alter_source_refresh_references(
             };
             reference_client.get_source_references().await?
         }
+        GenericSourceConnection::Solace(_) => {
+            sql_bail!("ALTER SOURCE ... REFRESH REFERENCES is not supported for Solace sources")
+        }
     };
     Ok(PurifiedStatement::PurifiedAlterSourceRefreshReferences {
         source_name: resolved_source_name,
@@ -2024,6 +2051,9 @@ async fn purify_create_table_from_source(
                 external_reference: export.external_reference,
                 details: PurifiedExportDetails::Kafka {},
             }
+        }
+        GenericSourceConnection::Solace(_) => {
+            sql_bail!("CREATE TABLE ... FROM SOURCE is not yet supported for Solace sources")
         }
     };
 

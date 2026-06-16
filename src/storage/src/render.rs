@@ -349,6 +349,16 @@ pub fn build_ingestion_dataflow(
                     storage_state,
                     base_source_config,
                 ),
+                GenericSourceConnection::Solace(c) => crate::render::sources::render_source(
+                    mz_scope,
+                    root_scope,
+                    &debug_name,
+                    c,
+                    description.clone(),
+                    feedback,
+                    storage_state,
+                    base_source_config,
+                ),
             };
             tokens.extend(source_tokens);
 

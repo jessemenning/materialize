@@ -133,6 +133,14 @@ pub trait ConnectionAccess: Clone + Debug + Eq + PartialEq + Serialize + 'static
         + Serialize
         + for<'a> Deserialize<'a>
         + AlterCompatible;
+    type Solace: Clone
+        + Debug
+        + Eq
+        + PartialEq
+        + Hash
+        + Serialize
+        + for<'a> Deserialize<'a>
+        + AlterCompatible;
 }
 
 /// Expresses that the struct contains references to connections. Use a
@@ -152,6 +160,7 @@ impl ConnectionAccess for ReferencedConnection {
     type MySql = CatalogItemId;
     type SqlServer = CatalogItemId;
     type IcebergCatalog = CatalogItemId;
+    type Solace = CatalogItemId;
 }
 
 /// Expresses that the struct contains an inlined definition of a connection.
@@ -169,4 +178,5 @@ impl ConnectionAccess for InlinedConnection {
     type MySql = super::MySqlConnection;
     type SqlServer = super::SqlServerConnectionDetails;
     type IcebergCatalog = super::IcebergCatalogConnection;
+    type Solace = super::SolaceConnection;
 }

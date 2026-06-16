@@ -2792,6 +2792,7 @@ impl ConnectionResolver for CatalogState {
             MySql(conn) => MySql(conn.into_inline_connection(self)),
             SqlServer(conn) => SqlServer(conn.into_inline_connection(self)),
             IcebergCatalog(conn) => IcebergCatalog(conn.into_inline_connection(self)),
+            Solace(conn) => Solace(conn),
         }
     }
 }

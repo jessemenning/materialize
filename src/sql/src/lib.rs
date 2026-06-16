@@ -160,3 +160,4 @@ pub mod plan;
 pub mod pure;
 pub mod rbac;
 pub mod session;
+pub mod solace_util;

@@ -17,6 +17,7 @@ import "storage-types/src/sources/kafka.proto";
 import "storage-types/src/sources/load_generator.proto";
 import "storage-types/src/sources/mysql.proto";
 import "storage-types/src/sources/postgres.proto";
+import "storage-types/src/sources/solace.proto";
 import "storage-types/src/sources/sql_server.proto";
 
 message ProtoSourceData {
@@ -36,5 +37,6 @@ message ProtoSourceExportStatementDetails {
     mz_storage_types.sources.sql_server.ProtoSqlServerSourceExportStatementDetails sql_server = 5;
     mz_storage_types.sources.load_generator.ProtoLoadGeneratorSourceExportStatementDetails loadgen = 3;
     mz_storage_types.sources.kafka.ProtoKafkaSourceExportStatementDetails kafka = 4;
+    mz_storage_types.sources.solace.ProtoSolaceSourceExportStatementDetails solace = 6;
   }
 }

@@ -379,6 +379,7 @@ pub enum Connection<C: ConnectionAccess = InlinedConnection> {
     MySql(MySqlConnection<C>),
     SqlServer(SqlServerConnectionDetails<C>),
     IcebergCatalog(IcebergCatalogConnection<C>),
+    Solace(SolaceConnection),
 }
 
 impl<R: ConnectionResolver> IntoInlineConnection<Connection, R>
@@ -403,6 +404,7 @@ impl<R: ConnectionResolver> IntoInlineConnection<Connection, R>
             Connection::IcebergCatalog(iceberg) => {
                 Connection::IcebergCatalog(iceberg.into_inline_connection(r))
             }
+            Connection::Solace(solace) => Connection::Solace(solace),
         }
     }
 }
@@ -422,6 +424,7 @@ impl<C: ConnectionAccess> Connection<C> {
             Connection::MySql(conn) => conn.validate_by_default(),
             Connection::SqlServer(conn) => conn.validate_by_default(),
             Connection::IcebergCatalog(conn) => conn.validate_by_default(),
+            Connection::Solace(conn) => conn.validate_by_default(),
         }
     }
 }
@@ -453,6 +456,7 @@ impl Connection<InlinedConnection> {
                 conn.validate(id, storage_configuration).await?;
             }
             Connection::IcebergCatalog(conn) => conn.validate(id, storage_configuration).await?,
+            Connection::Solace(conn) => conn.validate(id, storage_configuration).await?,
         }
         Ok(())
     }
@@ -528,6 +532,13 @@ impl Connection<InlinedConnection> {
             o => unreachable!("{o:?} is not an Iceberg catalog connection"),
         }
     }
+
+    pub fn unwrap_solace(self) -> <InlinedConnection as ConnectionAccess>::Solace {
+        match self {
+            Self::Solace(conn) => conn,
+            o => unreachable!("{o:?} is not a Solace connection"),
+        }
+    }
 }
 
 /// An error returned by [`Connection::validate`].
@@ -584,6 +595,7 @@ impl<C: ConnectionAccess> AlterCompatible for Connection<C> {
             (Self::Kafka(s), Self::Kafka(o)) => s.alter_compatible(id, o),
             (Self::Postgres(s), Self::Postgres(o)) => s.alter_compatible(id, o),
             (Self::MySql(s), Self::MySql(o)) => s.alter_compatible(id, o),
+            (Self::Solace(s), Self::Solace(o)) => s.alter_compatible(id, o),
             _ => {
                 tracing::warn!(
                     "Connection incompatible:\nself:\n{:#?}\n\nother\n{:#?}",
@@ -2960,6 +2972,48 @@ use self::inline::{
 impl AlterCompatible for SshConnection {
     fn alter_compatible(&self, _id: GlobalId, _other: &Self) -> Result<(), AlterError> {
         // Every element of the SSH connection is configurable.
+        Ok(())
+    }
+}
+
+/// A connection to a Solace Platform event broker for guaranteed messaging.
+///
+/// MVP scope is USERNAME + PASSWORD SECRET. Client-certificate and OAuth
+/// authentication, plus SSH tunnel support, land in later phases of the
+/// connector rollout.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct SolaceConnection {
+    /// Solace SMF or SMFS URL (e.g. `tcps://broker.example.com:55443`).
+    pub host: String,
+    /// Solace's tenant concept — required by the broker on bind.
+    pub msg_vpn: String,
+    pub username: String,
+    /// Reference to a SECRET containing the password. Resolved at runtime via
+    /// the `SecretsReader`.
+    pub password: CatalogItemId,
+}
+
+impl AlterCompatible for SolaceConnection {
+    fn alter_compatible(&self, _id: GlobalId, _other: &Self) -> Result<(), AlterError> {
+        // For MVP, every field of the Solace connection is freely alterable.
+        Ok(())
+    }
+}
+
+impl SolaceConnection {
+    fn validate_by_default(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn validate(
+        &self,
+        _id: CatalogItemId,
+        _storage_configuration: &StorageConfiguration,
+    ) -> Result<(), anyhow::Error> {
+        // Real broker bind-and-probe lands in Phase 2 (planner) alongside the
+        // SQL VALIDATE CONNECTION wiring; for the storage-types skeleton we
+        // accept all configurations.
         Ok(())
     }
 }

@@ -81,6 +81,11 @@ pub enum UpsertStyle {
         key_envelope: KeyEnvelope,
         error_column: String,
     },
+    /// `ENVELOPE UPSERT (KEY (...))` for sources (e.g. Solace FORMAT JSON) that have
+    /// no native message key. The key is assembled from INCLUDE metadata columns
+    /// (e.g. TOPIC LEVELS). `key_metadata_indices` are the positions within the
+    /// metadata row that form the key; the full output row is value cols + metadata cols.
+    MetadataKey { key_metadata_indices: Vec<usize> },
 }
 
 /// Computes the indices of the value's relation description that appear in the key.
@@ -253,6 +258,14 @@ impl UnplannedSourceEnvelope {
                     ty
                 ),
             },
+            // MetadataKey sources never reach UnplannedSourceEnvelope::desc() —
+            // the planner's MetadataKey early-return path constructs SourceEnvelope directly.
+            UnplannedSourceEnvelope::Upsert {
+                style: UpsertStyle::MetadataKey { .. },
+            } => unreachable!(
+                "MetadataKey sources are planned directly and should never \
+                 go through UnplannedSourceEnvelope::desc()"
+            ),
             UnplannedSourceEnvelope::CdcV2 => {
                 // the correct types
 
