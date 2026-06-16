@@ -62,10 +62,10 @@ jobs:
           large-packages: false
           swap-storage: false
 
-      - name: Install Rust 1.95.0
+      - name: Install Rust 1.96.0
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.95.0"
+          toolchain: "1.96.0"
           components: rustfmt, clippy
 
       - name: Install system dependencies
