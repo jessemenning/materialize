@@ -1,0 +1,20 @@
+name: Test ghcr.io push
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-push:
+    name: Test ghcr.io push auth
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Log in to ghcr.io
+        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u jessemenning --password-stdin
+
+      - name: Push test image
+        run: |
+          docker pull alpine:latest
+          docker tag alpine:latest ghcr.io/jessemenning/materialize-solace/ci-auth-test:latest
+          docker push ghcr.io/jessemenning/materialize-solace/ci-auth-test:latest
+          echo "SUCCESS"

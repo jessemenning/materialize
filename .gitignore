@@ -68,3 +68,5 @@ uv.lock
 /plots/
 /test/testdrive/types.parquet*
 /test/mz-deploy/**/target/
+doc/developer/design/20260526_solace_source_implementation_status.md
+.claude/scheduled_tasks.lock

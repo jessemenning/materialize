@@ -600,6 +600,14 @@ class CargoPreImage(PreImage):
         inputs.add("Cargo.lock")
         if Path(".cargo/config").exists():
             inputs.add(".cargo/config")
+        # Solace integration crates: parser (testdrive uses it client-side),
+        # planner, type definitions, and sink/source implementations.
+        # Also catch any dedicated solace*.rs files regardless of location.
+        inputs |= git.expand_globs(Path("."), "src/**/solace*.rs")
+        inputs |= git.expand_globs(Path("."), "src/sql-parser/src/**/*.rs")
+        inputs |= git.expand_globs(Path("."), "src/sql/src/**/*.rs")
+        inputs |= git.expand_globs(Path("."), "src/storage-types/src/**/*.rs")
+        inputs |= git.expand_globs(Path("."), "src/storage/src/**/*.rs")
         return frozenset(inputs)
 
     def inputs(self) -> set[str]:

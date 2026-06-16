@@ -184,6 +184,9 @@ class ServiceConfig(TypedDict, total=False):
     security_opt: list[str] | None
     """Additional security options to apply to the container."""
 
+    shm_size: str | int | None
+    """Size of /dev/shm for the container (e.g. "1g")."""
+
 
 class Service:
     """A Docker Compose service in a `Composition`.

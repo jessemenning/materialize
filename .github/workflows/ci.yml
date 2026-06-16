@@ -1,0 +1,252 @@
+# Copyright Materialize, Inc. and contributors. All rights reserved.
+#
+# Use of this software is governed by the Business Source License
+# included in the LICENSE file at the root of this repository.
+#
+# As of the Change Date specified in that file, in accordance with
+# the Business Source License, use of this software will be governed
+# by the Apache License, Version 2.0.
+
+# CI for the Solace source/sink connector work on this fork.
+#
+# Two jobs:
+#
+# * `check` — host-native `cargo check --workspace` on every push to main and
+#   every PR. Proves the Phase 1–3c changes type-check across the workspace
+#   without burning the budget for a full release build.
+#
+# * `solace-testdrive` — the live-broker mzcompose run from `test/solace/`.
+#   Gated to `workflow_dispatch` (manually triggered from the Actions tab)
+#   because it builds the full `materialized` + `testdrive` binaries inside
+#   the CI builder Docker container, which is a ~20 minute step on a cold
+#   cache.
+#
+#   Source workflows: round-trip, exactly-once
+#   Sink workflows:  sink-round-trip, sink-dedup, sink-dynamic-topic, sink-reconnect
+#
+# Upstream Materialize CI runs on Buildkite (`ci/test/pipeline.template.yml`),
+# which doesn't run on private forks; this is the GHA equivalent scoped to
+# the Solace connector work.
+
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+# Cancel older in-progress runs for the same PR when a new commit arrives.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: cargo check (workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # jlumbroso/free-disk-space is purpose-built for this — it recovers
+      # ~30+ GB by stripping out preinstalled toolchains the Materialize
+      # build doesn't use. Necessary on the default 4-core ubuntu-latest
+      # (14 GB free out-of-the-box) for Materialize's 34 GB target/ to fit.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            lld \
+            pkg-config \
+            libssl-dev \
+            libsasl2-dev \
+            protobuf-compiler \
+            cmake
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: solace-check
+          # Cache regardless of job outcome — if a build fails halfway through,
+          # the partial cache still helps the next attempt.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo check --workspace
+        run: cargo check --workspace
+        env:
+          # Incremental builds inside CI produce a huge target/ dir that the
+          # cache can't hold; non-incremental keeps the cache smaller.
+          CARGO_INCREMENTAL: "0"
+          # Match the workspace's RUSTFLAGS minus the cross-toolchain sysroot
+          # path (which only exists inside the ci-builder Docker image).
+          # `.cargo/config.toml` adds its own RUSTFLAGS too; this is the env
+          # override for any tooling that bypasses cargo's config layering.
+          RUSTFLAGS: --cfg=tokio_unstable
+
+  fingerprint-debug:
+    name: Dump mzbuild fingerprint inputs
+    runs-on: ubuntu-actual-22_04-8core-32gbram-300gbssd
+    timeout-minutes: 10
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Dump fingerprint inputs
+        run: bin/pyactivate ci/solace/fingerprint_debug.py > /tmp/ci_fingerprint.txt 2>&1
+      - name: Upload fingerprint manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-fingerprint
+          path: /tmp/ci_fingerprint.txt
+
+  build-images:
+    name: Build and push mzbuild images
+    runs-on: ubuntu-actual-22_04-8core-32gbram-300gbssd
+    timeout-minutes: 180
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: runner.environment == 'github-hosted'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Cache target-xcompile/
+        id: cache-target-xcompile
+        uses: actions/cache@v4
+        with:
+          path: target-xcompile
+          key: target-xcompile-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml', 'src/sql-parser/**/*.rs', 'src/sql/src/**/*.rs', 'src/storage-types/src/**/*.rs', 'src/storage/src/**/*.rs') }}
+          restore-keys: |
+            target-xcompile-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}-
+            target-xcompile-${{ runner.os }}-
+
+      # Self-hosted runners retain target-xcompile/ across runs on the
+      # persistent filesystem. When the primary cache key misses (or only a
+      # restore-key partial-match is found), stale compiled artifacts from a
+      # previous run can make cargo skip recompilation of changed crates.
+      # Delete the directory to guarantee cargo compiles from scratch whenever
+      # the exact cache key is not present.
+      - name: Clean stale build artifacts on cache miss
+        if: steps.cache-target-xcompile.outputs.cache-hit != 'true'
+        run: rm -rf target-xcompile
+
+      - name: Log in to ghcr.io
+        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u jessemenning --password-stdin
+
+      - name: Build and push images
+        run: bin/pyactivate ci/solace/build.py
+        env:
+          CARGO_BUILD_JOBS: "8"
+          CARGO_INCREMENTAL: "0"
+
+  solace-testdrive:
+    name: Solace mzcompose testdrive
+    runs-on: ubuntu-actual-22_04-8core-32gbram-300gbssd
+    timeout-minutes: 60
+    needs: build-images
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure kernel parameters for Solace broker
+        run: sudo sysctl -w vm.max_map_count=512000
+
+      - name: Log in to ghcr.io
+        run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u jessemenning --password-stdin
+
+      - name: Run round-trip workflow
+        run: ./bin/mzcompose --find solace --dev --image-registry ghcr.io/jessemenning/materialize-solace run round-trip
+
+      - name: Run exactly-once workflow
+        if: success()
+        run: ./bin/mzcompose --find solace --dev --image-registry ghcr.io/jessemenning/materialize-solace run exactly-once
+
+      - name: Run sink-round-trip workflow
+        if: success()
+        run: ./bin/mzcompose --find solace --dev --image-registry ghcr.io/jessemenning/materialize-solace run sink-round-trip
+
+      - name: Run sink-dedup workflow
+        if: success()
+        run: ./bin/mzcompose --find solace --dev --image-registry ghcr.io/jessemenning/materialize-solace run sink-dedup
+
+      - name: Run sink-dynamic-topic workflow
+        if: success()
+        run: ./bin/mzcompose --find solace --dev --image-registry ghcr.io/jessemenning/materialize-solace run sink-dynamic-topic
+
+      - name: Run sink-reconnect workflow
+        if: success()
+        run: ./bin/mzcompose --find solace --dev --image-registry ghcr.io/jessemenning/materialize-solace run sink-reconnect
+
+      - name: Capture mzcompose logs
+        if: always()
+        run: |
+          mkdir -p /tmp/solace-logs
+          docker ps -a >/tmp/solace-logs/containers.txt 2>&1 || true
+          for c in $(docker ps -a --format '{{.Names}}' | head -30); do
+            docker logs "$c" >/tmp/solace-logs/"$c.log" 2>&1 || true
+          done
+
+      - name: Tear down
+        if: always()
+        run: ./bin/mzcompose --find solace down -v
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solace-mzcompose-logs
+          path: /tmp/solace-logs/
+          if-no-files-found: warn
+
+  deploy-faa-staging:
+    name: Deploy new Materialize image to faa-continuum staging
+    runs-on: ubuntu-latest
+    needs: [solace-testdrive]
+    # Only auto-deploy on main branch workflow_dispatch runs after tests pass
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Trigger faa-continuum staging deploy
+        run: |
+          gh workflow run deploy.yml \
+            --repo jessemenning/faa-continuum \
+            --ref main \
+            --field environment=staging \
+            --field skip_build=true
+          echo "Triggered faa-continuum staging deploy — new Materialize image will be pulled and schema applied."
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_PAT }}
