@@ -463,6 +463,7 @@ fn parse_catalog_create_sql<'a>(a: &'a str) -> Result<Jsonb, EvalError> {
                     MySql { connection, .. } => ("mysql", Some(connection)),
                     SqlServer { connection, .. } => ("sql-server", Some(connection)),
                     LoadGenerator { .. } => ("load-generator", None),
+                    Solace { connection, .. } => ("solace", Some(connection)),
                 };
                 info.insert("source_type", json!(source_type));
                 if let Some(conn) = connection {
