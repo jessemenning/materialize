@@ -33,6 +33,7 @@ use mz_storage_types::sources::MzOffset;
 use mz_storage_types::sources::envelope::UpsertEnvelope;
 use mz_storage_types::sources::kafka::{KafkaTimestamp, RangeBound};
 use mz_storage_types::sources::mysql::GtidPartition;
+use mz_storage_types::sources::solace::SolaceTimestamp;
 use mz_timely_util::builder_async::{
     AsyncOutputHandle, Event as AsyncEvent, OperatorBuilder as AsyncOperatorBuilder,
     PressOnDropButton,
@@ -294,7 +295,7 @@ macro_rules! upsert_source_time_unit {
         }
     )+};
 }
-upsert_source_time_unit!(GtidPartition, Lsn);
+upsert_source_time_unit!(GtidPartition, Lsn, SolaceTimestamp);
 
 /// Pager for the upsert-v2 source stash.
 ///
