@@ -112,6 +112,7 @@ pub const KAFKA_LOW_WATERMARK_CHECK: Config<bool> = Config::new(
     true,
     "Whether to check the low watermark for Kafka sources and error if the start \
     offset/resume upper has been compacted away.",
+);
 
 /// Renamed from `solace_frontier_advance_interval`. Now controls the combined
 /// probe-and-frontier-flush cadence (the two were previously separate ticks;
