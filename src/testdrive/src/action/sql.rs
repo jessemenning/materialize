@@ -100,8 +100,8 @@ pub async fn run_sql(mut cmd: SqlCommand, state: &mut State) -> Result<ControlFl
             Ok(()) => {
                 let now = SystemTime::now();
                 let epoch = SystemTime::UNIX_EPOCH;
-                let ts = now.duration_since(epoch).unwrap().as_secs_f64();
-                let delay = now.duration_since(start).unwrap().as_secs_f64();
+                let ts = now.duration_since(epoch).unwrap_or_default().as_secs_f64();
+                let delay = now.duration_since(start).unwrap_or_default().as_secs_f64();
                 println!("rows match; continuing at ts {ts}, took {delay}s");
                 (state, Ok(()))
             }
