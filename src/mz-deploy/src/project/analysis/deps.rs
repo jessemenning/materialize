@@ -477,7 +477,8 @@ fn extract_source_connection_dep(
         CreateSourceConnection::Kafka { connection, .. }
         | CreateSourceConnection::Postgres { connection, .. }
         | CreateSourceConnection::SqlServer { connection, .. }
-        | CreateSourceConnection::MySql { connection, .. } => {
+        | CreateSourceConnection::MySql { connection, .. }
+        | CreateSourceConnection::Solace { connection, .. } => {
             deps.insert(ObjectId::from_raw_item_name(
                 connection,
                 default_database,

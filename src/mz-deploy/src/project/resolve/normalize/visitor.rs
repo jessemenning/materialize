@@ -153,6 +153,9 @@ impl<T: NameTransformer> NormalizingVisitor<T> {
                     self.normalize_raw_item_name(aws_connection);
                 }
             }
+            CreateSinkConnection::Solace { connection, .. } => {
+                self.normalize_raw_item_name(connection);
+            }
         }
     }
 
@@ -165,7 +168,8 @@ impl<T: NameTransformer> NormalizingVisitor<T> {
             CreateSourceConnection::Kafka { connection, .. }
             | CreateSourceConnection::Postgres { connection, .. }
             | CreateSourceConnection::SqlServer { connection, .. }
-            | CreateSourceConnection::MySql { connection, .. } => {
+            | CreateSourceConnection::MySql { connection, .. }
+            | CreateSourceConnection::Solace { connection, .. } => {
                 self.normalize_raw_item_name(connection);
             }
             CreateSourceConnection::LoadGenerator { .. } => {}

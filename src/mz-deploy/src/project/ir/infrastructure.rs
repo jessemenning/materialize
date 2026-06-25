@@ -103,6 +103,7 @@ fn connection_type_name(ct: &CreateConnectionType) -> &'static str {
         CreateConnectionType::GlueSchemaRegistry => "Glue Schema Registry",
         CreateConnectionType::SqlServer => "SQL Server",
         CreateConnectionType::IcebergCatalog => "Iceberg Catalog",
+        CreateConnectionType::Solace => "Solace",
     }
 }
 
@@ -218,6 +219,14 @@ fn extract_source(stmt: &mz_sql_parser::ast::CreateSourceStatement<Raw>) -> Infr
         CreateSourceConnection::LoadGenerator { generator, options } => (
             format!("Load Generator ({})", generator),
             None,
+            options_to_properties!(options),
+        ),
+        CreateSourceConnection::Solace {
+            connection,
+            options,
+        } => (
+            "Solace".to_string(),
+            Some(raw_item_name_to_string(connection)),
             options_to_properties!(options),
         ),
     };
