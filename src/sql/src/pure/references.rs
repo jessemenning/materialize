@@ -379,7 +379,9 @@ impl<'a> SourceReferenceClient<'a> {
             SourceReferenceClient::LoadGenerator { .. } => {
                 SourceReferenceResolver::new(LOAD_GENERATOR_DATABASE_NAME, &reference_names)
             }
-            SourceReferenceClient::MySql { .. } | SourceReferenceClient::Kafka { .. } => {
+            SourceReferenceClient::MySql { .. }
+            | SourceReferenceClient::Kafka { .. }
+            | SourceReferenceClient::Solace { .. } => {
                 SourceReferenceResolver::new(DATABASE_FAKE_NAME, &reference_names)
             }
         }?;
