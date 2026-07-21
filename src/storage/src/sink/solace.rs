@@ -123,14 +123,25 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
             let msg_vpn = connection.connection.msg_vpn.clone();
             let username = connection.connection.username.clone();
 
-            let session = AsyncSessionBuilder::new(&context)
+            let mut builder = AsyncSessionBuilder::new(&context)
                 .host_name(host.clone())
                 .vpn_name(msg_vpn.clone())
                 .username(username.clone())
                 .password(password.into_bytes())
                 .reconnect_retries(-1)
-                .reconnect_retry_wait_ms(1_000)
-                .build();
+                .reconnect_retry_wait_ms(1_000);
+
+            // Enable the TLS trust store for secure schemes (tcps:// SMF, wss://
+            // WebSocket). Public-CA brokers (e.g. Solace Cloud) validate against the
+            // OS CA bundle at /etc/ssl/certs. Override with SOLACE_SSL_TRUST_STORE_DIR
+            // for a private CA.
+            if host.starts_with("tcps://") || host.starts_with("wss://") {
+                let dir = std::env::var("SOLACE_SSL_TRUST_STORE_DIR")
+                    .unwrap_or_else(|_| "/etc/ssl/certs".to_string());
+                builder = builder.ssl_trust_store_dir(dir);
+            }
+
+            let session = builder.build();
             let session = match session {
                 Ok(s) => s,
                 Err(err) => {
