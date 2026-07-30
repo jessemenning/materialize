@@ -239,6 +239,28 @@ fn render_reader<'scope>(
                 "Solace source resuming from persisted watermark"
             );
 
+            // After a restart data_cap opens at SolaceTimestamp::minimum() (None).
+            // Advance it to the persisted watermark so the reclocker can
+            // immediately advance its output frontier past already-committed data,
+            // allowing queries at "now" to return without waiting for a new message.
+            if data_cap.time() < &initial_watermark {
+                data_cap.downgrade(&initial_watermark);
+            }
+
+            // Emit the startup probe BEFORE any broker I/O (secret read, session
+            // connect, flow bind). The watermark comes from persist, not the
+            // broker, so it is truthful regardless of connection state, and
+            // emitting it here lets remap mint a binding immediately. Queries
+            // issued right after (re)start therefore never block on broker
+            // reachability. This mirrors Kafka, whose metadata ticker fires its
+            // first probe immediately and independently of the data path.
+            emit_probe(
+                &probe_output,
+                &probe_cap,
+                (config.now_fn)().into(),
+                data_cap.time(),
+            );
+
             // Resolve the PASSWORD secret to a plaintext byte string.
             let password = match config
                 .config
@@ -453,27 +475,6 @@ fn render_reader<'scope>(
             let mut probe_ticker = probe::Ticker::new(
                 move || mz_storage_types::dyncfgs::SOLACE_PROBE_INTERVAL.get(&config_set),
                 config.now_fn.clone(),
-            );
-
-            // After a restart data_cap opens at SolaceTimestamp::minimum() (None).
-            // Advance it to the persisted watermark so the reclocker can
-            // immediately advance its output frontier past already-committed data,
-            // allowing queries at "now" to return without waiting for a new message.
-            if data_cap.time() < &initial_watermark {
-                data_cap.downgrade(&initial_watermark);
-            }
-
-            // Emit an initial probe at the resume point so reclock can mint a
-            // binding even before the first message arrives. This one uses an
-            // unrounded timestamp: the ticker's first (rounded) tick may not
-            // exceed the pipeline's synthetic seed probe and would then be
-            // dropped by the remap operator's strictly-newer gate, delaying
-            // restart visibility by up to one interval.
-            emit_probe(
-                &probe_output,
-                &probe_cap,
-                (config.now_fn)().into(),
-                data_cap.time(),
             );
 
             // Accumulates the highest ts_next seen across batches. Flushed into

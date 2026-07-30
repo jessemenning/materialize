@@ -255,8 +255,12 @@ Commits `d5277367893`, `ad54c5855eb`, `caf74d4d802`, `af899c8d733` on `main`.
    sources. The old "read once at source startup" caveat is gone.
 4. `probe_cap` is never downgraded anymore (Kafka pattern). The old synthetic
    `.next()` advancement and its divergence bug are gone.
-5. The 5×100ms startup probe burst was removed. The pipeline's synthetic seed probe
-   covers startup.
+5. The 5×100ms startup probe burst was removed. The source now emits its startup
+   probe before any broker I/O (secret read, session connect, flow bind), so
+   remap mints immediately on (re)start regardless of broker reachability. This
+   also let the fork-only synthetic seed probe in source_reader_pipeline.rs be
+   reverted to upstream behavior, removing the last fork change to the generic
+   source pipeline.
 6. The reader is clamped to a single hash-chosen worker. `PARALLELISM > 1` warns
    and no longer runs multiple probe loops, which used to stall remap minting via
    the last-writer-wins probe slot.
