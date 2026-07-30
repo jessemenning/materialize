@@ -21,12 +21,13 @@
 //!    the Solace message-id for later acknowledgement.
 //!
 //! 2. **`resume_uppers`** — Materialize's reclock layer reports that data up to
-//!    some frontier has been durably written to persist. The reader drains its
-//!    pending-ack buffer of every `(rgmid, msg_id)` whose `rgmid` is strictly
-//!    below the new frontier and calls `flow.ack(msg_id)`. This is the
-//!    Solace-side commit that lets the broker remove the messages from the
-//!    spool — and is the load-bearing piece of the exactly-once protocol: data
-//!    is durable in persist *before* the broker is told to forget it.
+//!    some frontier has been durably written to persist. The reader records
+//!    that boundary, and a budgeted drain (run after every loop iteration)
+//!    acks pending `(rgmid, msg_id)` pairs whose `rgmid` is strictly below it
+//!    via `flow.ack(msg_id)`. This is the Solace-side commit that lets the
+//!    broker remove the messages from the spool — and is the load-bearing
+//!    piece of the exactly-once protocol: data is durable in persist *before*
+//!    the broker is told to forget it.
 //!
 //! 3. **Probe tick** — a [`probe::Ticker`] emits a `Probe` carrying the
 //!    current data-frontier every `solace_probe_interval` so that reclock
@@ -89,6 +90,13 @@ use crate::source::{RawSourceCreationConfig, SourceMessage};
 /// progress-tracking messages across all workers) from O(msg_rate) to
 /// O(batch_rate), reducing coordination overhead at high ingest rates.
 const MAX_BATCH_SIZE: usize = 1_000;
+/// Maximum number of broker acks issued per receive-loop iteration. Each ack
+/// is a synchronous FFI call, so an unbounded drain after a large persist
+/// commit would stall the loop behind thousands of calls. The drain runs on
+/// every iteration, so even the idle probe tick alone sustains
+/// `ACK_DRAIN_BUDGET / probe_interval` acks per second, and under traffic
+/// every message wakeup drains as well — throughput is never ack-bound.
+const ACK_DRAIN_BUDGET: usize = 1_024;
 
 impl SourceRender for SolaceSourceConnection {
     type Time = SolaceTimestamp;
@@ -449,6 +457,11 @@ fn render_reader<'scope>(
             // once per batch.
             let mut pending_frontier: Option<SolaceTimestamp> = None;
 
+            // Everything strictly below this boundary is durable in persist
+            // and may be acked to the broker. `None` until the first commit
+            // (and again on the empty shutdown antichain) — nothing to ack.
+            let mut ack_boundary: Option<SolaceTimestamp> = None;
+
             loop {
                 // NOTE: arm order is load-bearing. The tick arm must outrank
                 // the recv arm so that probes (and the frontier flush they
@@ -458,10 +471,12 @@ fn render_reader<'scope>(
                 tokio::select! {
                     biased;
 
-                    // Persist has committed up to a new frontier; ack everything
-                    // below it.
+                    // Persist has committed up to a new frontier; record it.
+                    // The budgeted drain below the select! does the acking, so
+                    // a large commit never stalls this arm behind thousands of
+                    // synchronous ack FFI calls.
                     Some(frontier) = resume_uppers.next() => {
-                        drain_pending_acks(&mut pending_acks, &frontier, &flow, config.id);
+                        ack_boundary = frontier.as_option().cloned();
                     }
 
                     // Heartbeat: flush any pending frontier then emit a probe so
@@ -701,6 +716,18 @@ fn render_reader<'scope>(
                         }
                     }
                 }
+
+                // Ack up to ACK_DRAIN_BUDGET committed messages per iteration,
+                // regardless of which arm fired.
+                if let Some(boundary) = &ack_boundary {
+                    drain_pending_acks(
+                        &mut pending_acks,
+                        boundary,
+                        &flow,
+                        config.id,
+                        ACK_DRAIN_BUDGET,
+                    );
+                }
             }
         })
     });
@@ -905,32 +932,34 @@ fn compute_initial_watermark(
     watermark
 }
 
-/// Pop every pending `(rgmid, msg_id)` whose RGMID is strictly below the new
-/// frontier and call `flow.ack(msg_id)`. Per [`pending_acks`] invariants the
+/// Pop pending `(rgmid, msg_id)` entries whose RGMID is strictly below the
+/// commit boundary and call `flow.ack(msg_id)`, at most `budget` of them. The
 /// queue is ordered by RGMID, so the drain stops as soon as the head element
-/// is at or beyond the frontier.
+/// is at or beyond the boundary. Each ack is a synchronous FFI call (the SDK
+/// batches the actual transport acks internally), which is why the caller
+/// bounds the work per invocation.
 fn drain_pending_acks(
     pending_acks: &mut VecDeque<(SolaceTimestamp, u64)>,
-    frontier: &Antichain<SolaceTimestamp>,
+    boundary: &SolaceTimestamp,
     flow: &solace_rs::async_support::OwnedAsyncFlow,
     source_id: GlobalId,
+    budget: usize,
 ) {
-    let Some(boundary) = frontier.as_option().cloned() else {
-        // Empty antichain means the source is shutting down — nothing to ack.
-        return;
-    };
-    while let Some(&(rgmid, _)) = pending_acks.front() {
-        if rgmid < boundary {
-            let (_, msg_id) = pending_acks.pop_front().expect("front just observed");
-            if let Err(err) = flow.ack(msg_id) {
-                warn!(
-                    source_id = %source_id,
-                    error = %err.display_with_causes(),
-                    "failed to ack Solace message after persist commit"
-                );
+    let mut remaining = budget;
+    while remaining > 0 {
+        match pending_acks.front() {
+            Some(&(rgmid, _)) if rgmid < *boundary => {
+                let (_, msg_id) = pending_acks.pop_front().expect("front just observed");
+                if let Err(err) = flow.ack(msg_id) {
+                    warn!(
+                        source_id = %source_id,
+                        error = %err.display_with_causes(),
+                        "failed to ack Solace message after persist commit"
+                    );
+                }
+                remaining -= 1;
             }
-        } else {
-            break;
+            _ => break,
         }
     }
 }
