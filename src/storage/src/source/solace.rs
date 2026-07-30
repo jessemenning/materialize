@@ -159,7 +159,16 @@ fn render_reader<'scope>(
 
     let busy_signal = Arc::clone(&config.busy_signal);
     let parallelism = usize::cast_from(connection.parallelism);
-    let is_active_worker = config.worker_id < parallelism.min(config.worker_count);
+    // Exactly one worker (hash-chosen so multiple Solace sources spread
+    // across workers) binds a flow and probes. Running the reader on several
+    // workers is unsound today: the scalar SolaceTimestamp frontier cannot
+    // represent independent per-worker positions, and all workers' probes
+    // funnel into a single last-writer-wins watch slot, so a standby
+    // worker's stale frontier landing last stalls remap minting. Exclusive
+    // queues (required for replay-based resumption) deliver to one consumer
+    // anyway. True parallelism needs partitioned queues, a partitioned
+    // FromTime, and probe unioning across workers (Phase 8).
+    let is_active_worker = config.responsible_for(config.id);
     let export_ids: Vec<_> = config.source_exports.keys().copied().collect();
 
     // Per-export metadata-column specs. For the OLD-syntax MVP path there is
@@ -199,6 +208,16 @@ fn render_reader<'scope>(
 
             if !is_active_worker {
                 return;
+            }
+
+            if parallelism > 1 {
+                warn!(
+                    source_id = %config.id,
+                    parallelism,
+                    "Solace source PARALLELISM > 1 is clamped to a single \
+                     worker at runtime; see the module docs for why \
+                     multi-worker ingestion is unsound today"
+                );
             }
 
             // Initial RGMID watermark: the smallest source-time NOT yet
