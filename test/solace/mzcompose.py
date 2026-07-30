@@ -173,25 +173,37 @@ def provision_broker(c: Composition) -> None:
     credentials = base64.b64encode(b"admin:admin").decode()
 
     def _post(path: str, body: dict) -> None:
+        # Only a genuine ALREADY_EXISTS is benign. SEMP also returns HTTP 400
+        # while the message VPN is warming up after broker start; skipping
+        # those silently leaves the queue uncreated and the test ingests
+        # nothing, so retry with backoff instead.
         data = json.dumps(body).encode()
-        req = urllib.request.Request(
-            f"{semp_root}{path}",
-            data=data,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Basic {credentials}",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req) as resp:
-                print(f"SEMP POST {path}: {resp.status}")
-        except urllib.error.HTTPError as e:
-            # 400 / 409 mean "already exists" — idempotent, not a failure.
-            if e.code in (400, 409):
-                print(f"SEMP POST {path}: {e.code} (already exists, continuing)")
-            else:
-                raise
+        last_err = "unknown"
+        for attempt in range(20):
+            req = urllib.request.Request(
+                f"{semp_root}{path}",
+                data=data,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Basic {credentials}",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    print(f"SEMP POST {path}: {resp.status}")
+                    return
+            except urllib.error.HTTPError as e:
+                body_text = e.read().decode(errors="replace")[:300]
+                if "ALREADY_EXISTS" in body_text or e.code == 409:
+                    print(f"SEMP POST {path}: {e.code} (already exists, continuing)")
+                    return
+                last_err = f"{e.code} — {body_text}"
+            except urllib.error.URLError as e:
+                last_err = str(e)
+            print(f"SEMP POST {path}: not ready ({last_err}), retry {attempt + 1}/20")
+            time.sleep(3)
+        raise RuntimeError(f"SEMP POST {path} failed after retries: {last_err}")
 
     _post(
         "/clientUsernames",
@@ -595,30 +607,41 @@ PERF_GOALS: dict[str, dict] = {
 
 
 def _semp_post_perf(semp_port: int, path: str, body: dict) -> int:
-    """POST to SEMP; return status code. 400/409 (already-exists) treated as OK."""
+    """POST to SEMP; return status code. Only a genuine ALREADY_EXISTS is
+    treated as benign. SEMP also returns HTTP 400 while the message VPN is
+    still warming up after broker start; treating those as already-exists
+    silently skips queue creation and produces a zero-ingestion run, so any
+    other 4xx is retried with backoff and eventually raised.
+    """
     semp_root = f"http://127.0.0.1:{semp_port}/SEMP/v2/config/msgVpns/default"
     credentials = base64.b64encode(b"admin:admin").decode()
     data = json.dumps(body).encode()
-    req = urllib.request.Request(
-        f"{semp_root}{path}",
-        data=data,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Basic {credentials}",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            print(f"SEMP POST {path}: {resp.status}")
-            return resp.status
-    except urllib.error.HTTPError as e:
-        body_text = e.read().decode(errors="replace")[:200]
-        if e.code in (400, 409):
-            print(f"SEMP POST {path}: {e.code} (already exists, continuing)")
-            return e.code
-        print(f"SEMP POST {path}: ERROR {e.code} — {body_text}")
-        raise
+    last_err = "unknown"
+    for attempt in range(20):
+        req = urllib.request.Request(
+            f"{semp_root}{path}",
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Basic {credentials}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                print(f"SEMP POST {path}: {resp.status}")
+                return resp.status
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode(errors="replace")[:300]
+            if "ALREADY_EXISTS" in body_text or e.code == 409:
+                print(f"SEMP POST {path}: {e.code} (already exists, continuing)")
+                return e.code
+            last_err = f"{e.code} — {body_text}"
+        except urllib.error.URLError as e:
+            last_err = str(e)
+        print(f"SEMP POST {path}: not ready ({last_err}), retry {attempt + 1}/20")
+        time.sleep(3)
+    raise RuntimeError(f"SEMP POST {path} failed after retries: {last_err}")
 
 
 def _semp_queue_stats(semp_port: int, queue: str) -> dict:
