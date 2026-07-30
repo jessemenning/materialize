@@ -36,7 +36,7 @@ probe_wait / compute-overhead tradeoff without recompiling.
 ALTER SYSTEM SET solace_probe_interval = '200ms';
 ```
 
-### 3. Event-driven probing infrastructure (`SOLACE_EVENT_PROBE_MIN_GAP`)
+### 3. Event-driven probing infrastructure (`SOLACE_EVENT_PROBE_MIN_GAP`) — since removed
 
 Added a dyncfg to emit probes inline after each message batch, at a minimum gap rate,
 rather than waiting for the fixed timer. Intended to reduce `probe_wait` at the cost of
@@ -52,6 +52,9 @@ from 653ms to 984ms. See [PERF_TUNING.md](PERF_TUNING.md) for full analysis.
 
 Relevant commit: `2b2b7775e78`
 
+**Update 2026-07-30:** this path and its dyncfg were deleted. See the probe machinery
+overhaul section at the bottom of this document.
+
 ### 4. Full performance benchmark workflow
 
 Built out `workflow_perf` in `mzcompose.py` with:
@@ -63,6 +66,7 @@ Built out `workflow_perf` in `mzcompose.py` with:
 - Goal presets (`--goal throughput | balanced | latency`) that configure ack mode,
   deduplication, and parallelism in one flag
 - `--event-probe-min-gap` arg wired to `ALTER SYSTEM SET` before source creation
+  (removed 2026-07-30 along with the event-probe path)
 - Dynamic ghcr tag derivation from current git branch
 
 ### 5. Docker cache pre-warm workaround (`run-perf.sh`)
@@ -107,25 +111,24 @@ test/solace/run-perf.sh \
   --duration 600 \
   --poll-interval 60
 
-# With event-driven probing enabled:
-test/solace/run-perf.sh \
-  --goal throughput \
-  --probe-interval 200ms \
-  --event-probe-min-gap 100ms \
-  --rate 500 \
-  --duration 600
-
 # Override the ghcr tag (e.g. to test a specific feature-branch build):
 test/solace/run-perf.sh --ghcr-tag fix-solace-probe-frontier --goal throughput ...
 ```
+
+The `--event-probe-min-gap` flag no longer exists (removed 2026-07-30 with the
+event-probe path). `--probe-interval` is now also live-tunable on a running source
+via `ALTER SYSTEM SET solace_probe_interval`.
 
 **Goal presets:**
 
 | `--goal` | `ack_mode` | `deduplicate` | `parallelism` |
 |----------|-----------|--------------|--------------|
-| `throughput` | auto | false | 4 |
+| `throughput` | auto | false | 1 |
 | `balanced` | auto | false | 1 |
 | `latency` | client | true | 1 |
+
+All presets use `parallelism 1` since 2026-07-30. The source is clamped to a single
+hash-chosen worker and higher values only produce a warning.
 
 ---
 
@@ -141,6 +144,9 @@ test/solace/run-perf.sh --ghcr-tag fix-solace-probe-frontier --goal throughput .
 
 *q_backlog metric was broken in early runs (used wrong SEMP fields).
 
+All rows predate the 2026-07-30 probe machinery overhaul. The event-driven row
+measured a mechanism that has since been deleted.
+
 **Latency floor at best config (200ms probe, no event probe):**
 
 ```
@@ -155,40 +161,30 @@ floor        392ms   (actual avg 653ms due to poll-time jitter)
 
 ## Open investigations
 
-### A. Event-driven probing crossover point
+### A. Interval matrix re-run under probe::Ticker rounding
 
-Event-driven probing is expected to help on production hardware where the MV cascade
-recomputes faster. Hypothesis: `mv_cascade` on production is ~30–50ms vs. 205ms on this
-dev machine, putting the crossover above 20 probes/sec.
+The event-driven probing crossover investigation and the adaptive probe rate idea
+that previously occupied this section are obsolete. Both paths were deleted in the
+2026-07-30 probe machinery overhaul (see below), because probe rounding gives one
+distinct downstream timestamp per interval without a probe rate that scales with
+message rate. The open item now is a plain re-run of the interval matrix (100ms,
+200ms, 500ms, 1s at rate 500) under the new machinery, plus the catch-up and restart
+measurements listed in that section.
 
-**How to test:**
-1. Run `--event-probe-min-gap 100ms` (10 probes/sec) on dev hardware — if mv3_ms <
-   250ms it's below the crossover here too; if mv3_ms ≥ 250ms the crossover is below 10.
-2. Run the same configuration on a production-grade machine and compare.
-3. Target: confirm that some `event_probe_min_gap` value lowers avg lag below 392ms on
-   production hardware.
+### B. Multi-worker / partitioned-queue parallelism (future work)
 
-### B. Adaptive probe rate (future feature)
+The source is now clamped to a single hash-chosen worker, so parallelism scaling as
+previously framed no longer applies. Historical context: all pre-overhaul throughput
+runs used `PARALLELISM 4`, but only one flow delivers on an exclusive queue and the
+extra workers' stale probes stalled remap minting roughly half of all intervals.
+Queue depth never exceeded 153 messages at 500 msg/sec, so compute, not ingest, was
+the bottleneck anyway. True parallelism would need partitioned queues on the broker
+side, a partitioned `FromTime`, and probe unioning across workers.
 
-Rather than a fixed min gap, a smarter policy would back off probe rate when `mv3_ms`
-exceeds a configurable threshold. This would give the latency benefit when compute has
-headroom and automatically retreat when saturated. Not implemented yet.
+### C. Upstream PR to MaterializeInc/materialize
 
-Implementation sketch: track a rolling `mv3_ms` estimate in the source loop
-(available in the probe response message) and gate inline probes on
-`mv3_ms < solace_event_probe_max_cascade_ms`.
-
-### C. Parallelism scaling
-
-All tests used `PARALLELISM 4` for the throughput goal. Queue depth never exceeded 153
-messages even at 500 msg/sec — the bottleneck is compute, not ingest. Higher parallelism
-(8, 16) may help if compute is parallelizable, but requires a non-exclusive queue on the
-broker side.
-
-### D. Upstream PR to MaterializeInc/materialize
-
-The probe/frontier fix is the primary candidate for upstreaming. Event-driven probing
-and the performance benchmark workflow are Solace-specific and would stay in this fork.
+The probe/frontier fix is the primary candidate for upstreaming. The performance
+benchmark workflow is Solace-specific and would stay in this fork.
 
 Before upstreaming:
 1. Confirm the fix does not regress any existing Solace testdrive tests
@@ -202,8 +198,8 @@ Before upstreaming:
 
 | File | Purpose |
 |------|---------|
-| `src/storage/src/source/solace.rs` | Source implementation — probe/frontier fix, event-driven probing |
-| `src/storage-types/src/dyncfgs.rs` | Dyncfg declarations: `SOLACE_PROBE_INTERVAL`, `SOLACE_EVENT_PROBE_MIN_GAP`, `SOLACE_CATCHUP_PROBE_ENABLED` |
+| `src/storage/src/source/solace.rs` | Source implementation — probe/frontier fix, probing via `probe::Ticker` (event probing removed 2026-07-30) |
+| `src/storage-types/src/dyncfgs.rs` | Dyncfg declarations: `SOLACE_PROBE_INTERVAL`, `SOLACE_RGMID_ORDER_VALIDATION` (`SOLACE_EVENT_PROBE_MIN_GAP` and `SOLACE_CATCHUP_PROBE_ENABLED` removed 2026-07-30) |
 | `src/storage/src/sink/solace.rs` | Sink implementation (clippy fixes applied) |
 | `test/solace/mzcompose.py` | Full perf workflow, SEMP polling, goal presets |
 | `test/solace/perf-setup.td` | DDL: source, MVs, sink for perf runs |
@@ -237,3 +233,64 @@ Build takes ~25–40 minutes. Monitor with:
 gh run list --repo SolaceDev/materialize-solace --limit 5
 gh run watch <RUN_ID> --repo SolaceDev/materialize-solace
 ```
+
+---
+
+## 2026-07-30 — Probe machinery overhaul (probe::Ticker rounding)
+
+Commits `d5277367893`, `ad54c5855eb`, `caf74d4d802`, `af899c8d733` on `main`.
+
+### What changed
+
+1. Probing now goes through `probe::Ticker` (`src/storage/src/source/probe.rs`).
+   Probe timestamps are rounded down to multiples of `solace_probe_interval`. The
+   remap operator only mints a binding for a strictly newer probe timestamp, so
+   minting is hard-capped at one binding per interval regardless of message rate.
+2. The inline catch-up probe path and the event-driven probe path were deleted as
+   dead code under rounding. Dyncfgs `solace_catchup_probe_enabled` and
+   `solace_event_probe_min_gap` no longer exist, and `mzcompose.py` no longer has
+   `--event-probe-min-gap`.
+3. `solace_probe_interval` (still default 200ms) is re-read by the ticker after
+   every tick, so `ALTER SYSTEM SET solace_probe_interval` applies to running
+   sources. The old "read once at source startup" caveat is gone.
+4. `probe_cap` is never downgraded anymore (Kafka pattern). The old synthetic
+   `.next()` advancement and its divergence bug are gone.
+5. The 5×100ms startup probe burst was removed. The pipeline's synthetic seed probe
+   covers startup.
+6. The reader is clamped to a single hash-chosen worker. `PARALLELISM > 1` warns
+   and no longer runs multiple probe loops, which used to stall remap minting via
+   the last-writer-wins probe slot.
+7. Acks are drained with a budget (1024 per iteration) outside the select arms. The
+   resume_uppers arm only records the commit boundary.
+8. Per-message RGMID ordering validation is gated behind dyncfg
+   `solace_rgmid_order_validation` (default false), and metadata extraction is
+   skipped when no INCLUDE columns are requested.
+
+### Updated cost model
+
+`lag_ms ≈ broker_lag + probe_wait + mv_cascade`, where `probe_wait ≈
+probe_interval/2` is now the only interval-dependent term. Remap minting (persist
+compare-and-append plus read-back) happens exactly once per interval, idle or busy.
+During backlog replay the mint rate no longer scales with message rate. Previously
+it was roughly one mint per 1000-message batch via the catch-up path. Distinct
+downstream timestamps are capped at one per interval, so `mv_cascade` should no
+longer grow when the interval shrinks as severely as before. The old event-probing
+experiment that regressed 653ms to 984ms was measuring exactly that timestamp
+churn, and that mechanism is deleted.
+
+### Expected effects
+
+- Catch-up drain time should improve sharply, since the mint rate drops from
+  roughly batch rate to one per interval.
+- Steady state at 200ms should be roughly unchanged.
+- `mv_cascade` should not regress, and smaller intervals should now be viable
+  where they previously saturated compute.
+
+### To be measured
+
+No new numbers exist yet. All of the following are to be measured:
+
+- Interval matrix (100ms, 200ms, 500ms, 1s) at rate 500.
+- Catch-up profile at rate 5000 (backlog drain under the one-mint-per-interval
+  regime).
+- Restart-to-first-row latency after the startup-burst removal.

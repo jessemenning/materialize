@@ -19,25 +19,39 @@ lag_ms ≈ broker_lag + probe_wait + mv_cascade
 |------|--------------|----------------|
 | `broker_lag` | +2–5ms | Time between message publish and broker timestamp assignment. Near-zero means the broker stamps on receipt. |
 | `probe_wait` (`src_ms`) | ≈ probe_interval / 2 | A `SELECT` against the source blocks until the next frontier advance (probe). On average, a message waits half the probe interval. |
-| `mv_cascade` (`mv3_ms`) | 190–300ms | Time for mv1→mv2→mv3 to recompute after a frontier advance. Grows with probe frequency (more re-evaluations per second = more contention). |
+| `mv_cascade` (`mv3_ms`) | 190–300ms | Time for mv1→mv2→mv3 to recompute after a frontier advance. One recomputation per distinct downstream timestamp, which is now capped at one per probe interval. |
 
-**Key insight:** reducing probe interval reduces `probe_wait` linearly, but increases
-`mv_cascade` because compute recomputes more often. There is a crossover point where
-more-frequent probing makes lag worse, not better.
+**Key insight (updated 2026-07-30):** probing now goes through `probe::Ticker`
+(`src/storage/src/source/probe.rs`), which rounds probe timestamps down to multiples
+of `solace_probe_interval`. The remap operator only mints a binding for a strictly
+newer probe timestamp, so remap minting (one persist compare-and-append plus a listen
+read-back) happens exactly once per interval, idle or busy, regardless of message
+rate. `probe_wait ≈ probe_interval/2` is the only interval-dependent term left.
+Downstream dataflows see one distinct timestamp per interval, so shrinking the
+interval should no longer inflate `mv_cascade` as severely as before. The old
+crossover behaviour documented below (653ms → 984ms under 50ms event probing) was
+measuring timestamp churn from the event-probe mechanism, which has been deleted.
+The interval matrix still needs re-measurement under the new machinery.
 
 ---
 
 ## Configuration knobs
 
-All three are read **once at source startup** and cached for the lifetime of the source
-worker. `ALTER SYSTEM SET` must be issued **before `CREATE SOURCE`**; changes after the
-source is running have no effect until the source is dropped and recreated.
+`solace_probe_interval` is re-read by the probe ticker after every tick, so
+`ALTER SYSTEM SET` applies to **running** sources. Setting it before `CREATE SOURCE`
+is no longer required, though doing so avoids one interval of mixed cadence while the
+new value takes effect.
 
 | Dyncfg | Default | Effect |
 |--------|---------|--------|
-| `solace_probe_interval` | 1s | Timer-based probe cadence. Controls `probe_wait` in steady state. |
-| `solace_event_probe_min_gap` | 0 (disabled) | Minimum gap between event-driven probes emitted after each message batch. Enables probing at message-arrival rate rather than fixed timer rate. |
-| `solace_catchup_probe_enabled` | true | When a full batch (≥1000 msgs) is drained, emit a probe immediately. Useful for backlog catch-up on restart. No effect in steady state at 500 msg/sec. |
+| `solace_probe_interval` | 200ms | Probe cadence and the quantum probe timestamps are rounded down to. Controls `probe_wait` and caps remap minting at one binding per interval. Live-tunable. |
+| `solace_rgmid_order_validation` | false | Diagnostic: cross-checks byte-wise RGMID ordering against the C SDK comparator per message pair. Costs one FFI call per message, leave off in perf runs. |
+
+**Removed knobs (2026-07-30):** `solace_event_probe_min_gap` and
+`solace_catchup_probe_enabled` no longer exist. Under probe rounding, minting is
+hard-capped at one binding per interval regardless of message rate, which made both
+the event-driven and catch-up probe paths dead code. They were deleted along with
+their dyncfgs. Historical measurements of those paths are preserved below.
 
 Source-level options (set in `CREATE SOURCE ... FROM SOLACE`):
 
@@ -45,7 +59,7 @@ Source-level options (set in `CREATE SOURCE ... FROM SOLACE`):
 |--------|----------------|--------------|--------|
 | `ACK MODE` | `auto` | `client` | `client` = ack after persist-commit (exactly-once); `auto` = ack on delivery (at-most-once, higher throughput) |
 | `DEDUPLICATE` | `false` | `true` | Watermark-based dedup on restart; adds ~208ms of persist latency per message batch when true |
-| `PARALLELISM` | 4 | 1 | Worker count. More workers increase throughput but require a non-exclusive queue. |
+| `PARALLELISM` | 1 | 1 | The reader is now clamped to a single hash-chosen worker. Values > 1 log a warning and have no effect. Multiple probe loops used to stall remap minting via the last-writer-wins probe slot. True parallelism needs partitioned queues (future work). |
 | `ACK WINDOW SIZE` | 4096 | 255 | Broker-side max unacked messages before flow control. |
 | `FLOW MAX UNACKED` | -1 (broker default) | 10000 | Cap on unacked messages in flight. |
 
@@ -62,6 +76,11 @@ All runs: 500 msg/sec, 300k messages, `--goal throughput` unless noted.
 | Post probe-fix, 200ms | 200ms | off | 653ms | 184ms | 205ms | 0–153 | First clean run with working `q_backlog` |
 | Latency goal, 200ms | 200ms | off | ~645ms | ~240ms | ~200ms | 0–50 | `ack_mode=client` + `deduplicate=true` added ~208ms persist latency, mostly cancelling the probe gain |
 | Event probe, 50ms gap | 200ms | 50ms | **984ms** | 224ms | **294ms** | 0–135 | Worse than no event probing — compute saturated, cascade ~45% slower |
+
+> **Note (2026-07-30):** all runs above predate the `probe::Ticker` rounding change.
+> The event-probe row measured a mechanism that has since been deleted. The other
+> rows remain the best available baselines but the interval matrix should be re-run
+> under the new machinery.
 
 ### q_backlog behaviour
 
@@ -95,7 +114,11 @@ committed boundary. Implemented in `src/storage/src/source/solace.rs`.
 
 ---
 
-## Event-driven probing — findings
+## Event-driven probing — findings (historical, mechanism removed 2026-07-30)
+
+> The event-driven probe path and its dyncfg were deleted when probing moved to
+> `probe::Ticker` rounding, which caps minting at one binding per interval and made
+> the path dead code. The findings below are kept because they motivated the change.
 
 **Hypothesis:** emitting a probe after each message batch (rather than waiting for the
 timer) should reduce `probe_wait` from `probe_interval/2` to `event_probe_min_gap/2`.
@@ -116,17 +139,18 @@ On this dev machine, the threshold is somewhere between 5 and 20 probes/sec.
 **The queue never backed up** — the bottleneck was compute re-evaluation speed, not
 ingest capacity.
 
-**Next steps for event-driven probing:**
-
-1. Try `--event-probe-min-gap 100ms` (10 probes/sec) — likely still above the crossover
-   on this hardware, but worth measuring.
-2. Try on production-grade hardware where the cascade recomputation is faster.
-3. Consider making event-driven probing conditional on `mv3_ms < threshold` so it
-   backs off automatically when compute is saturated.
+**Resolution (2026-07-30):** rather than tuning the event-probe gap or adding
+adaptive backoff, the mechanism was removed. Probe rounding through `probe::Ticker`
+gives the intended outcome directly, one distinct downstream timestamp per interval,
+without a probe rate that scales with message rate. The remaining tuning question is
+the plain interval matrix (100ms/200ms/500ms/1s), to be re-measured.
 
 ---
 
 ## Lag budget at current best config (200ms timer, no event probe)
+
+> Measured before the 2026-07-30 `probe::Ticker` change. Steady-state behaviour at
+> 200ms is expected to be roughly unchanged, but the budget should be re-measured.
 
 ```
 broker_lag   +3ms    (broker stamps on receipt — no room to improve)
@@ -161,18 +185,22 @@ test/solace/run-perf.sh \
 
 # Override the ghcr tag if needed (e.g. to test a specific branch build):
 # test/solace/run-perf.sh --ghcr-tag fix-solace-probe-frontier --goal throughput ...
-
-# Optional: event-driven probing (currently makes things worse at 50ms on dev hardware)
-# --event-probe-min-gap 50ms
 ```
+
+The `--event-probe-min-gap` flag was removed from `mzcompose.py` along with the
+event-driven probe path (2026-07-30). `--probe-interval` can also be changed on a
+running source via `ALTER SYSTEM SET solace_probe_interval`.
 
 **Goal presets** (`--goal`):
 
 | Goal | `ack_mode` | `deduplicate` | `parallelism` | Use for |
 |------|-----------|--------------|--------------|---------|
-| `throughput` | auto | false | 4 | Max throughput, at-most-once |
+| `throughput` | auto | false | 1 | Max throughput, at-most-once |
 | `balanced` | auto | false | 1 | Single-worker baseline |
 | `latency` | client | true | 1 | Exactly-once, latency measurement |
+
+All presets now use `parallelism 1`. The source is clamped to a single worker, so
+higher values only produce a warning.
 
 ---
 
@@ -180,8 +208,8 @@ test/solace/run-perf.sh \
 
 | File | Change |
 |------|--------|
-| `src/storage/src/source/solace.rs` | Probe/frontier fix; event-driven probe implementation |
-| `src/storage-types/src/dyncfgs.rs` | Added `SOLACE_EVENT_PROBE_MIN_GAP`, `SOLACE_CATCHUP_PROBE_ENABLED` |
+| `src/storage/src/source/solace.rs` | Probe/frontier fix; event-driven probe implementation (event probing since removed, 2026-07-30) |
+| `src/storage-types/src/dyncfgs.rs` | Added `SOLACE_EVENT_PROBE_MIN_GAP`, `SOLACE_CATCHUP_PROBE_ENABLED` (both since removed, 2026-07-30) |
 | `src/storage/src/sink/solace.rs` | Fixed clippy: `HashMap→BTreeMap`, `.zip→.zip_eq` |
 | `test/solace/mzcompose.py` | Full perf workflow: background publisher, poll loop, lag decomposition report, SEMP q_backlog metric |
 | `test/solace/perf-setup.td` | DDL for perf source, MVs, sink |
