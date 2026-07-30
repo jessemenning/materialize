@@ -35,10 +35,10 @@
 //!    queue never advances the source frontier, `resume_uppers` never moves,
 //!    acks never fire, and the broker keeps the spool growing. Probe
 //!    timestamps are rounded down to interval multiples (like every other
-//!    source), which hard-caps remap binding minting — and thus downstream
-//!    timestamp churn — at one binding per interval regardless of message
-//!    rate: the remap operator only mints for a strictly newer probe
-//!    timestamp.
+//!    source). Because the remap operator only mints for a strictly newer
+//!    probe timestamp, rounding hard-caps binding minting, and thus
+//!    downstream timestamp churn, at one binding per interval regardless of
+//!    message rate.
 //!
 //! Phase 3c follow-ups: `INCLUDE`-metadata column population (currently the
 //! metadata row is empty; the planner sets up the column shape but the
@@ -95,7 +95,7 @@ const MAX_BATCH_SIZE: usize = 1_000;
 /// commit would stall the loop behind thousands of calls. The drain runs on
 /// every iteration, so even the idle probe tick alone sustains
 /// `ACK_DRAIN_BUDGET / probe_interval` acks per second, and under traffic
-/// every message wakeup drains as well — throughput is never ack-bound.
+/// every message wakeup drains as well. Throughput is never ack-bound.
 const ACK_DRAIN_BUDGET: usize = 1_024;
 
 impl SourceRender for SolaceSourceConnection {
@@ -223,8 +223,8 @@ fn render_reader<'scope>(
                     source_id = %config.id,
                     parallelism,
                     "Solace source PARALLELISM > 1 is clamped to a single \
-                     worker at runtime; see the module docs for why \
-                     multi-worker ingestion is unsound today"
+                     worker at runtime. See the module docs for why \
+                     multi-worker ingestion is unsound today."
                 );
             }
 
@@ -369,7 +369,7 @@ fn render_reader<'scope>(
             if connection.flow_max_unacked == -1 {
                 warn!(
                     source_id = %config.id,
-                    "FLOW MAX UNACKED is -1 (broker-configured); if the queue's \
+                    "FLOW MAX UNACKED is -1 (broker-configured). If the queue's \
                      max-delivered-unacked-msgs-per-flow is unlimited, client-side \
                      buffering (pending acks and the receive channel) is unbounded. \
                      Set an explicit FLOW MAX UNACKED to bound source memory."
@@ -410,8 +410,8 @@ fn render_reader<'scope>(
             // (SOLCLIENT_FLOW_PROP_MAX_UNACKED_MESSAGES), so the broker stops
             // delivering once that many messages are outstanding. This queue
             // plus the receive channel therefore hold at most FLOW MAX UNACKED
-            // messages — unless FLOW MAX UNACKED is -1 and the broker-side
-            // limit is unlimited (warned about at flow creation).
+            // messages. The exception is FLOW MAX UNACKED = -1 with an
+            // unlimited broker-side limit (warned about at flow creation).
             let mut pending_acks: VecDeque<(SolaceTimestamp, u64)> =
                 VecDeque::with_capacity(MAX_BATCH_SIZE);
             // Diagnostic RGMID-ordering cross-check against the C SDK
@@ -445,10 +445,10 @@ fn render_reader<'scope>(
             // Probe timestamps come from a Ticker, which rounds them down to
             // multiples of the (live-tunable) probe interval. The remap
             // operator mints a binding only for a strictly newer probe
-            // timestamp, so rounding hard-caps the remap minting rate — and
-            // with it persist compare-and-append traffic and the number of
-            // distinct timestamps downstream dataflows must re-evaluate at —
-            // to one binding per interval.
+            // timestamp, so rounding hard-caps the remap minting rate at one
+            // binding per interval, and with it persist compare-and-append
+            // traffic and the number of distinct timestamps downstream
+            // dataflows must re-evaluate at.
             let config_set = config.config.config_set().clone();
             let mut probe_ticker = probe::Ticker::new(
                 move || mz_storage_types::dyncfgs::SOLACE_PROBE_INTERVAL.get(&config_set),
@@ -484,14 +484,15 @@ fn render_reader<'scope>(
             let mut pending_frontier: Option<SolaceTimestamp> = None;
 
             // Everything strictly below this boundary is durable in persist
-            // and may be acked to the broker. `None` until the first commit
-            // (and again on the empty shutdown antichain) — nothing to ack.
+            // and may be acked to the broker. `None` means nothing to ack,
+            // both before the first commit and on the empty shutdown
+            // antichain.
             let mut ack_boundary: Option<SolaceTimestamp> = None;
 
             loop {
                 // NOTE: arm order is load-bearing. The tick arm must outrank
                 // the recv arm so that probes (and the frontier flush they
-                // carry) are not starved during backlog replay — the timer
+                // carry) are not starved during backlog replay. The timer
                 // alone drives reclock minting at exactly one binding per
                 // interval while messages stream in.
                 tokio::select! {

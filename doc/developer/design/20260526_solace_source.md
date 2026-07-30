@@ -200,7 +200,7 @@ Acks are issued per message id after persist commit completes, in RGMID order. T
 
 ### Backpressure
 
-Solace's `FLOW MAX UNACKED` is the broker's lever for backpressure: if the source has that many messages outstanding, the broker stops delivering. Because every client-side buffer entry (the receive channel and the pending-ack queue) is a delivered-but-unacked message, `FLOW MAX UNACKED` also bounds source memory — if persist is slow, unacked grows, the broker slows down, and no unbounded growth occurs. The exception is `FLOW MAX UNACKED = -1` (delegate to the queue's `max-delivered-unacked-msgs-per-flow`), which is unbounded if the broker-side limit is unlimited; the source warns at flow creation in that configuration.
+Solace's `FLOW MAX UNACKED` is the broker's lever for backpressure: if the source has that many messages outstanding, the broker stops delivering. Because every client-side buffer entry (the receive channel and the pending-ack queue) is a delivered-but-unacked message, `FLOW MAX UNACKED` also bounds source memory — if persist is slow, unacked grows, the broker slows down, and no unbounded growth occurs. The exception is `FLOW MAX UNACKED = -1` (delegate to the queue's `max-delivered-unacked-msgs-per-flow`), which is unbounded if the broker-side limit is unlimited. The source warns at flow creation in that configuration.
 
 ### Parallel consumers
 

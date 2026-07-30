@@ -134,14 +134,14 @@ pub const SOLACE_PROBE_INTERVAL: Config<Duration> = Config::new(
 /// Diagnostic cross-check of the RGMID ordering assumption underlying
 /// `SolaceTimestamp`: byte-wise `Ord` must agree with the Solace C SDK
 /// comparator within a single broker/HA pair. Costs one extra FFI call per
-/// message, so it is off by default; enable to gather evidence in an
+/// message, so it is off by default. Enable it to gather evidence in an
 /// environment where the assumption is in doubt.
 pub const SOLACE_RGMID_ORDER_VALIDATION: Config<bool> = Config::new(
     "solace_rgmid_order_validation",
     false,
     "When true, the Solace source cross-checks byte-wise RGMID ordering against \
     the Solace C SDK comparator for every consecutive message pair and logs a \
-    warning on disagreement. Diagnostic only; costs one FFI call per message.",
+    warning on disagreement. Diagnostic only, costs one FFI call per message.",
 );
 
 pub const KAFKA_DEFAULT_AWS_PRIVATELINK_ENDPOINT_IDENTIFICATION_ALGORITHM: Config<&'static str> =
