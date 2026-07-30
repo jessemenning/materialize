@@ -131,6 +131,19 @@ pub const SOLACE_PROBE_INTERVAL: Config<Duration> = Config::new(
     the cost of more frequent compute re-evaluations.",
 );
 
+/// Diagnostic cross-check of the RGMID ordering assumption underlying
+/// `SolaceTimestamp`: byte-wise `Ord` must agree with the Solace C SDK
+/// comparator within a single broker/HA pair. Costs one extra FFI call per
+/// message, so it is off by default; enable to gather evidence in an
+/// environment where the assumption is in doubt.
+pub const SOLACE_RGMID_ORDER_VALIDATION: Config<bool> = Config::new(
+    "solace_rgmid_order_validation",
+    false,
+    "When true, the Solace source cross-checks byte-wise RGMID ordering against \
+    the Solace C SDK comparator for every consecutive message pair and logs a \
+    warning on disagreement. Diagnostic only; costs one FFI call per message.",
+);
+
 pub const KAFKA_DEFAULT_AWS_PRIVATELINK_ENDPOINT_IDENTIFICATION_ALGORITHM: Config<&'static str> =
     Config::new(
         "kafka_default_aws_privatelink_endpoint_identification_algorithm",
@@ -424,6 +437,7 @@ pub fn all_dyncfgs(configs: ConfigSet) -> ConfigSet {
         .add(&SINK_ENSURE_TOPIC_CONFIG)
         .add(&SINK_PROGRESS_SEARCH)
         .add(&SOLACE_PROBE_INTERVAL)
+        .add(&SOLACE_RGMID_ORDER_VALIDATION)
         .add(&SQL_SERVER_SOURCE_VALIDATE_RESTORE_HISTORY)
         .add(&STORAGE_DOWNGRADE_SINCE_DURING_FINALIZATION)
         .add(&STORAGE_ROCKSDB_CLEANUP_TRIES)

@@ -366,6 +366,16 @@ fn render_reader<'scope>(
                 }
             };
 
+            if connection.flow_max_unacked == -1 {
+                warn!(
+                    source_id = %config.id,
+                    "FLOW MAX UNACKED is -1 (broker-configured); if the queue's \
+                     max-delivered-unacked-msgs-per-flow is unlimited, client-side \
+                     buffering (pending acks and the receive channel) is unbounded. \
+                     Set an explicit FLOW MAX UNACKED to bound source memory."
+                );
+            }
+
             if let Err(err) = flow.start() {
                 emit_halting(
                     &health_output,
@@ -394,10 +404,26 @@ fn render_reader<'scope>(
 
             // (rgmid, msg_id) pairs awaiting persist-commit before they can be
             // acked to the broker. Ordered by RGMID within this flow.
+            //
+            // Boundedness: every entry is a delivered-but-unacked message, and
+            // the flow is created with FLOW MAX UNACKED
+            // (SOLCLIENT_FLOW_PROP_MAX_UNACKED_MESSAGES), so the broker stops
+            // delivering once that many messages are outstanding. This queue
+            // plus the receive channel therefore hold at most FLOW MAX UNACKED
+            // messages — unless FLOW MAX UNACKED is -1 and the broker-side
+            // limit is unlimited (warned about at flow creation).
             let mut pending_acks: VecDeque<(SolaceTimestamp, u64)> =
                 VecDeque::with_capacity(MAX_BATCH_SIZE);
+            // Diagnostic RGMID-ordering cross-check against the C SDK
+            // comparator. Off by default: it costs one FFI call per message.
+            let rgmid_order_validation = mz_storage_types::dyncfgs::SOLACE_RGMID_ORDER_VALIDATION
+                .get(config.config.config_set());
             // Tracks the previous message's raw RGMID bytes for per-flow ordering validation.
             let mut prev_rgmid: Option<[u8; 16]> = None;
+            // Metadata extraction is skipped entirely when no export requests
+            // INCLUDE columns: it costs several FFI getters plus allocations
+            // per message.
+            let needs_metadata = export_metadata_cols.iter().any(|cols| !cols.is_empty());
 
             // Reusable heap buffers. Declared outside the select! loop so
             // their allocated capacity persists across iterations, eliminating
@@ -553,7 +579,10 @@ fn render_reader<'scope>(
                             // src/storage-types/src/sources/solace.rs:350-356 asserts
                             // these agree within a single broker/HA pair; this check
                             // produces empirical evidence for or against that assertion.
-                            if let Some(prev) = prev_rgmid {
+                            // NOTE: an ordering regression is legitimate on flow
+                            // reconnect (broker redelivery), so a disagreement warn
+                            // is evidence to investigate, not proof of unsoundness.
+                            if let Some(prev) = prev_rgmid.filter(|_| rgmid_order_validation) {
                                 use solace_rs::message::compare_replication_group_message_ids;
                                 match compare_replication_group_message_ids(
                                     &prev,
@@ -585,7 +614,9 @@ fn render_reader<'scope>(
                                     }
                                 }
                             }
-                            prev_rgmid = Some(rgmid_bytes);
+                            if rgmid_order_validation {
+                                prev_rgmid = Some(rgmid_bytes);
+                            }
 
                             let msg_id = match msg.get_msg_id() {
                                 Ok(Some(id)) => id,
@@ -616,6 +647,13 @@ fn render_reader<'scope>(
                             // strips the SDT container header that the Python
                             // Messaging API adds to string payloads. Fall back to
                             // the raw binary getter for non-string attachments.
+                            // NOTE: this order is load-bearing. The binary getter
+                            // (getBinaryAttachmentPtr) SUCCEEDS on SDT-string
+                            // messages, returning the SDT-wrapped bytes, so
+                            // binary-first would silently corrupt string payloads.
+                            // The string getter returns NotFound cheaply for
+                            // binary payloads, so the extra FFI call is the price
+                            // of correct SDT detection.
                             let payload = msg
                                 .get_payload_as_string()
                                 .ok()
@@ -639,8 +677,10 @@ fn render_reader<'scope>(
 
                             // Extract all metadata fields once per message so
                             // each per-export build_metadata_row call below never
-                            // re-invokes the Solace C SDK.
-                            let extracted = extract_msg_fields(&msg, rgmid_bytes);
+                            // re-invokes the Solace C SDK. Skipped entirely when
+                            // no export requests INCLUDE columns.
+                            let extracted =
+                                needs_metadata.then(|| extract_msg_fields(&msg, rgmid_bytes));
 
                             // Push one flat emit entry per export. On the last
                             // (or only) export, move key/value instead of
@@ -649,7 +689,12 @@ fn render_reader<'scope>(
                             for (export_idx, cols) in
                                 export_metadata_cols.iter().enumerate()
                             {
-                                let metadata = build_metadata_row(&extracted, cols);
+                                let metadata = match &extracted {
+                                    Some(fields) => build_metadata_row(fields, cols),
+                                    // No INCLUDE columns anywhere: the metadata
+                                    // row is empty for every export.
+                                    None => Row::default(),
+                                };
                                 let is_last = export_idx + 1 == n_exports;
                                 let key = if is_last {
                                     std::mem::take(&mut key_row)
