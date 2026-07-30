@@ -513,7 +513,10 @@ fn upsert_commands<'scope, T: Timestamp, FromTime: Timestamp>(
 
         // MetadataKey: for sources like Solace FORMAT JSON that have no native message key.
         // The key is assembled from INCLUDE metadata columns (e.g. tl_N from TOPIC LEVELS).
-        if let UpsertStyle::MetadataKey { ref key_metadata_indices } = upsert_envelope.style {
+        if let UpsertStyle::MetadataKey {
+            ref key_metadata_indices,
+        } = upsert_envelope.style
+        {
             let metadata = result.metadata;
             // Collect once so each key column is O(1) to index; avoids re-walking the datum
             // iterator O(idx) times for every key column on every message.
@@ -530,7 +533,7 @@ fn upsert_commands<'scope, T: Timestamp, FromTime: Timestamp>(
             let value = match result.value {
                 Some(Ok(ref row)) => {
                     let mut packer = row_buf.packer();
-                    packer.extend_by_row(row);       // value cols (e.g. `data` jsonb)
+                    packer.extend_by_row(row); // value cols (e.g. `data` jsonb)
                     packer.extend_by_row(&metadata); // metadata cols (tl_1..tl_N, broker_ts, topic)
                     Some(Ok(row_buf.clone()))
                 }

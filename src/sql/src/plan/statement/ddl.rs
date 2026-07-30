@@ -1664,7 +1664,9 @@ fn apply_source_envelope_encoding(
                 let source_arity = full_desc.arity();
                 let desc = full_desc.with_key(key_indices.clone());
                 let envelope = SourceEnvelope::Upsert(UpsertEnvelope {
-                    style: UpsertStyle::MetadataKey { key_metadata_indices },
+                    style: UpsertStyle::MetadataKey {
+                        key_metadata_indices,
+                    },
                     key_indices,
                     source_arity,
                 });
