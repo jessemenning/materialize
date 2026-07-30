@@ -28,11 +28,16 @@
 //!    spool — and is the load-bearing piece of the exactly-once protocol: data
 //!    is durable in persist *before* the broker is told to forget it.
 //!
-//! 3. **Probe tick** — every second the reader emits a `Probe` carrying the
-//!    current data-frontier so that reclock mints fresh bindings even when the
-//!    queue is idle. Without this, an idle queue never advances the source
-//!    frontier, `resume_uppers` never moves, acks never fire, and the broker
-//!    keeps the spool growing.
+//! 3. **Probe tick** — a [`probe::Ticker`] emits a `Probe` carrying the
+//!    current data-frontier every `solace_probe_interval` so that reclock
+//!    mints fresh bindings even when the queue is idle. Without this, an idle
+//!    queue never advances the source frontier, `resume_uppers` never moves,
+//!    acks never fire, and the broker keeps the spool growing. Probe
+//!    timestamps are rounded down to interval multiples (like every other
+//!    source), which hard-caps remap binding minting — and thus downstream
+//!    timestamp churn — at one binding per interval regardless of message
+//!    rate: the remap operator only mints for a strictly newer probe
+//!    timestamp.
 //!
 //! Phase 3c follow-ups: `INCLUDE`-metadata column population (currently the
 //! metadata row is empty; the planner sets up the column shape but the
@@ -44,7 +49,6 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
 
 use chrono::{DateTime, NaiveDateTime};
 use differential_dataflow::AsCollection;
@@ -73,21 +77,13 @@ use timely::dataflow::operators::Capability;
 use timely::dataflow::operators::core::Partition;
 use timely::dataflow::{Scope, StreamVec};
 use timely::progress::Antichain;
-use tokio::time::interval;
 use tracing::{info, warn};
 
 use crate::healthcheck::{HealthStatusMessage, HealthStatusUpdate, StatusNamespace};
+use crate::source::probe;
 use crate::source::types::{FuelSize, Probe, SignaledFuture, SourceRender, StackedCollection};
 use crate::source::{RawSourceCreationConfig, SourceMessage};
 
-/// Number of rapid probes emitted at startup before entering the steady-state
-/// probe loop. Spaced `STARTUP_PROBE_INTERVAL` apart, giving the Timely
-/// scheduler multiple opportunities to process them before the first user
-/// query arrives.
-const STARTUP_PROBE_COUNT: u32 = 5;
-/// Spacing between startup burst probes. Short enough to prime the reclock
-/// within ~500ms; long enough for each probe to be scheduled and processed.
-const STARTUP_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 /// Maximum number of messages drained from `flow.try_recv()` per select! arm
 /// firing. Batching amortises Timely capability downgrades (which trigger
 /// progress-tracking messages across all workers) from O(msg_rate) to
@@ -191,7 +187,14 @@ fn render_reader<'scope>(
 
     let button = builder.build(move |caps| {
         SignaledFuture::new(busy_signal, async move {
-            let [mut data_cap, health_cap, mut probe_cap] = caps.try_into().unwrap();
+            // NOTE: probe_cap is never downgraded, mirroring the Kafka
+            // metadata fetcher. The probe stream is consumed by
+            // `broadcast().inspect(...)` into a tokio watch channel
+            // (record-driven, nothing frontier-buffered), so the capability's
+            // position is irrelevant; only the probe PAYLOAD carries meaning.
+            // Downgrading it with synthetic timestamps caused it to diverge
+            // from data_cap and silently fail later downgrades.
+            let [mut data_cap, health_cap, probe_cap] = caps.try_into().unwrap();
             let mut health_cap = Some(health_cap);
 
             if !is_active_worker {
@@ -386,64 +389,53 @@ fn render_reader<'scope>(
             let mut ack_batch: Vec<(SolaceTimestamp, u64)> = Vec::with_capacity(MAX_BATCH_SIZE);
 
             let mut resume_uppers = std::pin::pin!(resume_uppers);
-            let probe_interval_duration =
-                mz_storage_types::dyncfgs::SOLACE_PROBE_INTERVAL.get(config.config.config_set());
-            let mut probe_interval = interval(probe_interval_duration);
-            // Skip the immediate first tick; we want to wait probe_interval_duration
-            // between emissions.
-            probe_interval.tick().await;
+            // Probe timestamps come from a Ticker, which rounds them down to
+            // multiples of the (live-tunable) probe interval. The remap
+            // operator mints a binding only for a strictly newer probe
+            // timestamp, so rounding hard-caps the remap minting rate — and
+            // with it persist compare-and-append traffic and the number of
+            // distinct timestamps downstream dataflows must re-evaluate at —
+            // to one binding per interval.
+            let config_set = config.config.config_set().clone();
+            let mut probe_ticker = probe::Ticker::new(
+                move || mz_storage_types::dyncfgs::SOLACE_PROBE_INTERVAL.get(&config_set),
+                config.now_fn.clone(),
+            );
 
-            let catchup_probe_enabled = mz_storage_types::dyncfgs::SOLACE_CATCHUP_PROBE_ENABLED
-                .get(config.config.config_set());
-
-            let event_probe_min_gap = mz_storage_types::dyncfgs::SOLACE_EVENT_PROBE_MIN_GAP
-                .get(config.config.config_set());
-            let event_probe_enabled = !event_probe_min_gap.is_zero();
-            // Tracks when any probe was last emitted (timer or event) so the
-            // event path can rate-limit itself to event_probe_min_gap.
-            let mut last_probe_emitted = tokio::time::Instant::now();
-
-            // After a restart the caps open at SolaceTimestamp::minimum() (None).
-            // Advance them to the persisted watermark so the reclocker can
+            // After a restart data_cap opens at SolaceTimestamp::minimum() (None).
+            // Advance it to the persisted watermark so the reclocker can
             // immediately advance its output frontier past already-committed data,
             // allowing queries at "now" to return without waiting for a new message.
             if data_cap.time() < &initial_watermark {
                 data_cap.downgrade(&initial_watermark);
-                let _ = probe_cap.try_downgrade(&initial_watermark);
             }
 
             // Emit an initial probe at the resume point so reclock can mint a
-            // binding even before the first message arrives.
-            emit_probe(&probe_output, &probe_cap, &config, data_cap.time());
-
-            // Startup burst: emit STARTUP_PROBE_COUNT rapid probes spaced
-            // STARTUP_PROBE_INTERVAL apart. Gives the Timely scheduler multiple
-            // scheduling cycles to propagate the initial probe through remap
-            // before any user query arrives — avoiding a multi-second stall on
-            // schema_ok / populate_view_registry on fresh starts.
-            //
-            // NOTE: probe_cap is intentionally NOT advanced here (no synthetic
-            // RGMID increments). Advancing probe_cap with synthetic .next()
-            // values can place it ahead of the first real broker RGMIDs; the
-            // subsequent probe_cap.try_downgrade(&real_ts) calls then fail
-            // silently, leaving probe_cap and data_cap diverged until they
-            // re-sync via natural message flow. The probe PAYLOAD
-            // (upstream_frontier = data_cap.time()) carries the semantic
-            // content; probe_cap's position only affects Timely GC, which
-            // will catch up when probe_cap is advanced to the first real RGMID.
-            for _ in 0..STARTUP_PROBE_COUNT {
-                tokio::time::sleep(STARTUP_PROBE_INTERVAL).await;
-                emit_probe(&probe_output, &probe_cap, &config, data_cap.time());
-            }
+            // binding even before the first message arrives. This one uses an
+            // unrounded timestamp: the ticker's first (rounded) tick may not
+            // exceed the pipeline's synthetic seed probe and would then be
+            // dropped by the remap operator's strictly-newer gate, delaying
+            // restart visibility by up to one interval.
+            emit_probe(
+                &probe_output,
+                &probe_cap,
+                (config.now_fn)().into(),
+                data_cap.time(),
+            );
 
             // Accumulates the highest ts_next seen across batches. Flushed into
-            // data_cap within the probe_interval tick (before the probe is emitted)
+            // data_cap within the probe tick (before the probe is emitted)
             // so the probe always carries the current committed boundary, and
-            // compute re-evaluates at most once per probe_interval instead of
+            // compute re-evaluates at most once per probe interval instead of
             // once per batch.
             let mut pending_frontier: Option<SolaceTimestamp> = None;
 
             loop {
+                // NOTE: arm order is load-bearing. The tick arm must outrank
+                // the recv arm so that probes (and the frontier flush they
+                // carry) are not starved during backlog replay — the timer
+                // alone drives reclock minting at exactly one binding per
+                // interval while messages stream in.
                 tokio::select! {
                     biased;
 
@@ -461,25 +453,14 @@ fn render_reader<'scope>(
                     // not the stale max_ts. With two separate ticks the probe arm
                     // (higher biased-select priority) would have fired first,
                     // emitting the old data_cap and leaving the correct frontier
-                    // pending for one more second — doubling query latency.
-                    _ = probe_interval.tick() => {
+                    // pending for one more tick — doubling query latency.
+                    probe_ts = probe_ticker.tick() => {
                         if let Some(ts) = pending_frontier.take() {
                             if data_cap.time() < &ts {
                                 data_cap.downgrade(&ts);
-                                let _ = probe_cap.try_downgrade(&ts);
                             }
                         }
-                        emit_probe(&probe_output, &probe_cap, &config, data_cap.time());
-                        // Advance probe_cap by one step so Timely can immediately
-                        // GC this probe record rather than accumulating records at
-                        // the same SolaceTimestamp indefinitely. The probe PAYLOAD
-                        // carries data_cap.time() (the real source frontier), so
-                        // reclock still mints accurate bindings regardless of
-                        // probe_cap's position.
-                        if let Some(next) = probe_cap.time().next() {
-                            let _ = probe_cap.try_downgrade(&next);
-                        }
-                        last_probe_emitted = tokio::time::Instant::now();
+                        emit_probe(&probe_output, &probe_cap, probe_ts, data_cap.time());
                     }
 
                     // A new message has arrived. Drain all currently-queued
@@ -506,10 +487,6 @@ fn render_reader<'scope>(
                                 break;
                             }
                         }
-                        // True if the broker queue had ≥ MAX_BATCH_SIZE messages
-                        // ready — used below as a catch-up indicator.
-                        let batch_was_full = raw_batch.len() >= MAX_BATCH_SIZE;
-
                         emit_batch.clear();
                         ack_batch.clear();
                         let mut max_ts: Option<SolaceTimestamp> = None;
@@ -673,7 +650,6 @@ fn render_reader<'scope>(
                         // ONE capability downgrade covers every timestamp in the batch.
                         if data_cap.time() < &max_ts {
                             data_cap.downgrade(&max_ts);
-                            let _ = probe_cap.try_downgrade(&max_ts);
                         }
 
                         for (ts, export_idx, source_message) in emit_batch.drain(..) {
@@ -692,48 +668,17 @@ fn render_reader<'scope>(
                         pending_acks.extend(ack_batch.drain(..));
 
                         // Accumulate the post-batch advance; flushed into
-                        // data_cap within the probe_interval tick so compute
-                        // re-evaluates at most once per probe_interval instead of
-                        // once per batch — except during catch-up (see below).
+                        // data_cap within the probe tick so compute
+                        // re-evaluates at most once per probe interval instead
+                        // of once per batch. No inline probes here: probe
+                        // timestamps are rounded to interval multiples, so an
+                        // extra same-interval probe would never pass the remap
+                        // operator's strictly-newer gate anyway.
                         if let Some(ts_next) = max_ts.next() {
                             pending_frontier = Some(match pending_frontier.take() {
                                 Some(prev) => prev.max(ts_next),
                                 None => ts_next,
                             });
-                        }
-
-                        // Emit an inline probe when warranted, without waiting
-                        // for the next probe_interval tick:
-                        //
-                        // Event-driven mode (SOLACE_EVENT_PROBE_MIN_GAP > 0):
-                        //   Probe after any batch once min_gap has elapsed since
-                        //   the last probe (timer or event). Reduces steady-state
-                        //   query latency from ~probe_interval/2 to ~min_gap/2 at
-                        //   the cost of more frequent MV re-evaluations.
-                        //   Supersedes the catch-up path when enabled.
-                        //
-                        // Catch-up mode (SOLACE_CATCHUP_PROBE_ENABLED, default on):
-                        //   Probe after full batches (broker had ≥ MAX_BATCH_SIZE
-                        //   messages queued). Drives reclock at batch rate during
-                        //   backlog replay without permanently increasing probe
-                        //   frequency in steady state.
-                        let should_probe_inline = if event_probe_enabled {
-                            last_probe_emitted.elapsed() >= event_probe_min_gap
-                        } else {
-                            catchup_probe_enabled && batch_was_full
-                        };
-                        if should_probe_inline {
-                            if let Some(ts) = pending_frontier.take() {
-                                if data_cap.time() < &ts {
-                                    data_cap.downgrade(&ts);
-                                    let _ = probe_cap.try_downgrade(&ts);
-                                }
-                            }
-                            emit_probe(&probe_output, &probe_cap, &config, data_cap.time());
-                            if let Some(next) = probe_cap.time().next() {
-                                let _ = probe_cap.try_downgrade(&next);
-                            }
-                            last_probe_emitted = tokio::time::Instant::now();
                         }
                     }
                 }
@@ -974,17 +919,18 @@ fn drain_pending_acks(
 /// Emit a heartbeat `Probe` so reclock can mint a binding even when the
 /// broker is quiet. The probe carries the current source-frontier so the
 /// reclock layer knows the source is alive and has advanced (or is stuck) at
-/// the reported time.
+/// the reported time. `probe_ts` should come from a [`probe::Ticker`] so it
+/// is rounded to the probe interval (the initial startup probe is the one
+/// deliberate exception).
 fn emit_probe(
     probe_output: &AsyncOutputHandle<
         SolaceTimestamp,
         CapacityContainerBuilder<Vec<Probe<SolaceTimestamp>>>,
     >,
     probe_cap: &Capability<SolaceTimestamp>,
-    config: &RawSourceCreationConfig,
+    probe_ts: mz_repr::Timestamp,
     current_time: &SolaceTimestamp,
 ) {
-    let probe_ts: mz_repr::Timestamp = (config.now_fn)().into();
     let upstream_frontier = Antichain::from_elem(current_time.clone());
     probe_output.give(
         probe_cap,

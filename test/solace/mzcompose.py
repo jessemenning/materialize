@@ -770,19 +770,11 @@ def workflow_perf(c: Composition, parser: WorkflowArgumentParser) -> None:
         help="Override solace_probe_interval dyncfg (e.g. '200ms'). Defaults to goal's value.",
     )
     parser.add_argument(
-        "--event-probe-min-gap",
-        type=str,
-        default=None,
-        help="Set solace_event_probe_min_gap dyncfg (e.g. '50ms'). Enables event-driven probing "
-        "after message batches; reduces lag at the cost of more frequent MV re-evaluations. "
-        "Default: disabled (timer-only probing).",
-    )
-    parser.add_argument(
         "--ghcr-tag",
         type=str,
         default=None,
         help="ghcr alias tag to pull (e.g. 'fix-solace-probe-frontier', 'latest'). "
-             "Defaults to the sanitized current git branch name, or 'latest' on main.",
+        "Defaults to the sanitized current git branch name, or 'latest' on main.",
     )
     args = parser.parse_args()
 
@@ -804,11 +796,6 @@ def workflow_perf(c: Composition, parser: WorkflowArgumentParser) -> None:
         f"  ack_mode={goal_cfg['ack_mode']}  parallelism={goal_cfg['parallelism']}  deduplicate={goal_cfg['deduplicate']}"
     )
     print(f"  probe_interval={probe_interval}")
-    event_probe_min_gap = args.event_probe_min_gap
-    if event_probe_min_gap:
-        print(
-            f"  event_probe_min_gap={event_probe_min_gap} (event-driven probing enabled)"
-        )
     print(f"{'='*60}")
 
     # NOTE: Docker cache pre-warming (pulling ghcr.io/jessemenning images and
@@ -857,8 +844,9 @@ def workflow_perf(c: Composition, parser: WorkflowArgumentParser) -> None:
     )
 
     # ---- Apply dyncfg overrides BEFORE source creation ----------------------
-    # CRITICAL: SOLACE_PROBE_INTERVAL is read once at source startup; setting
-    # it after CREATE SOURCE has no effect on the running source.
+    # SOLACE_PROBE_INTERVAL is re-read by the source's probe ticker after
+    # every tick, so changes apply to running sources too. Setting it before
+    # CREATE SOURCE just avoids one interval of mixed cadence.
     mz_sys_port = c.port("materialized", 6877)
     subprocess.run(
         [
@@ -878,26 +866,6 @@ def workflow_perf(c: Composition, parser: WorkflowArgumentParser) -> None:
         capture_output=True,
     )
     print(f"solace_probe_interval set to {probe_interval}")
-
-    if event_probe_min_gap:
-        subprocess.run(
-            [
-                "psql",
-                "-h",
-                "127.0.0.1",
-                "-p",
-                str(mz_sys_port),
-                "-U",
-                "mz_system",
-                "-d",
-                "materialize",
-                "-c",
-                f"ALTER SYSTEM SET solace_event_probe_min_gap = '{event_probe_min_gap}'",
-            ],
-            check=True,
-            capture_output=True,
-        )
-        print(f"solace_event_probe_min_gap set to {event_probe_min_gap}")
 
     # ---- DDL setup via direct SQL -------------------------------------------
     print("\nCreating source, MVs, and sink via SQL...")

@@ -114,50 +114,21 @@ pub const KAFKA_LOW_WATERMARK_CHECK: Config<bool> = Config::new(
     offset/resume upper has been compacted away.",
 );
 
-/// Renamed from `solace_frontier_advance_interval`. Now controls the combined
-/// probe-and-frontier-flush cadence (the two were previously separate ticks;
-/// merging them ensures each probe carries a current frontier).
+/// Probe cadence AND probe-timestamp rounding quantum for the Solace source.
+/// Probe timestamps are rounded down to multiples of this interval (via
+/// `probe::Ticker`), so remap binding minting is hard-capped at one binding
+/// per interval regardless of message rate. Deliberately independent of
+/// `timestamp_interval`, which is pinned to 1s by min==max system vars, to
+/// allow lower-latency operation. Read through the Ticker's closure, so
+/// changes apply without a source restart.
 pub const SOLACE_PROBE_INTERVAL: Config<Duration> = Config::new(
     "solace_probe_interval",
     Duration::from_millis(200),
     "How often the Solace source emits a reclock probe and advances the output \
-    frontier. Lower values reduce query latency at the cost of more frequent \
-    compute re-evaluations; higher values reduce compute overhead under high \
-    ingest rates. Default 200ms: best result from FAA benchmark at 500 msg/s \
-    (653ms avg lag vs 712ms at 500ms, vs ~1900ms pre-fix baseline).",
-);
-
-pub const SOLACE_CATCHUP_PROBE_ENABLED: Config<bool> = Config::new(
-    "solace_catchup_probe_enabled",
-    true,
-    "When true, the Solace source emits an extra reclock probe after each message \
-    batch when more messages are already queued (catch-up / backlog-replay mode). \
-    This drives the reclock pipeline at batch rate during startup catch-up, \
-    reducing the time to reach real-time. Disable if compute re-evaluation \
-    overhead during backlog replay is unacceptable.",
-);
-
-/// Minimum gap between event-driven probes emitted inline after message batches.
-/// Zero (default) disables event-driven probing; the source then relies solely
-/// on the `solace_probe_interval` timer plus the catch-up probe path.
-///
-/// When non-zero, the source emits a probe immediately after draining a batch
-/// if at least this much time has elapsed since the last probe was emitted
-/// (by any path — timer or event). This keeps the reclock advancing at roughly
-/// the message-arrival rate during steady-state ingestion, reducing query
-/// latency from ~probe_interval/2 to ~event_probe_min_gap/2.
-///
-/// Trade-off: smaller gaps reduce latency but increase the rate of downstream
-/// MV re-evaluations. A value of 50ms at 500 msg/sec emits ~20 probes/sec
-/// instead of 2–5 probes/sec, increasing compute re-evaluation frequency ~5–10×.
-pub const SOLACE_EVENT_PROBE_MIN_GAP: Config<Duration> = Config::new(
-    "solace_event_probe_min_gap",
-    Duration::ZERO,
-    "Minimum time between event-driven probes in the Solace source. When non-zero, \
-    a probe is emitted inline after each message batch if at least this duration \
-    has elapsed since the previous probe. Reduces steady-state query latency at \
-    the cost of more frequent compute re-evaluations. Zero (default) disables \
-    event-driven probing.",
+    frontier, and the quantum probe timestamps are rounded to. Bounds remap \
+    binding minting at one binding per interval. Lower values reduce query \
+    latency (steady-state lag is roughly interval/2 plus persist latency) at \
+    the cost of more frequent compute re-evaluations.",
 );
 
 pub const KAFKA_DEFAULT_AWS_PRIVATELINK_ENDPOINT_IDENTIFICATION_ALGORITHM: Config<&'static str> =
@@ -452,8 +423,6 @@ pub fn all_dyncfgs(configs: ConfigSet) -> ConfigSet {
         .add(&REPLICA_METRICS_HISTORY_RETENTION_INTERVAL)
         .add(&SINK_ENSURE_TOPIC_CONFIG)
         .add(&SINK_PROGRESS_SEARCH)
-        .add(&SOLACE_CATCHUP_PROBE_ENABLED)
-        .add(&SOLACE_EVENT_PROBE_MIN_GAP)
         .add(&SOLACE_PROBE_INTERVAL)
         .add(&SQL_SERVER_SOURCE_VALIDATE_RESTORE_HISTORY)
         .add(&STORAGE_DOWNGRADE_SINCE_DURING_FINALIZATION)
