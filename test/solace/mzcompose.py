@@ -407,6 +407,26 @@ def workflow_exactly_once(c: Composition, parser: WorkflowArgumentParser) -> Non
     c.run_testdrive_files("--no-reset", "exactly-once-after.td")
 
 
+def workflow_upsert_key(c: Composition, parser: WorkflowArgumentParser) -> None:
+    """Metadata-keyed upsert: ENVELOPE UPSERT (KEY (...)) keyed on a topic
+    level. Verifies latest-write-per-key dedup and that a null key column
+    surfaces as an upsert error."""
+    parser.parse_args()
+
+    ensure_vm_max_map_count(c)
+    c.up("solace", "materialized")
+    provision_broker(c)
+    # Both queues need a topic subscription so topic publishes fan in.
+    provision_sink_queues(
+        c,
+        [
+            ("mz_upsert_q", "mz/upsert/>"),
+            ("mz_upsert_null_q", "mznull/>"),
+        ],
+    )
+    c.run_testdrive_files("upsert-key.td")
+
+
 # ---------------------------------------------------------------------------
 # Sink workflows
 # ---------------------------------------------------------------------------

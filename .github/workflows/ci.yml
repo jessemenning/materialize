@@ -196,6 +196,10 @@ jobs:
         if: success()
         run: ./bin/mzcompose --find solace --dev --image-registry ghcr.io/jessemenning/materialize-solace run exactly-once
 
+      - name: Run upsert-key workflow
+        if: success()
+        run: ./bin/mzcompose --find solace --dev --image-registry ghcr.io/jessemenning/materialize-solace run upsert-key
+
       - name: Run sink-round-trip workflow
         if: success()
         run: ./bin/mzcompose --find solace --dev --image-registry ghcr.io/jessemenning/materialize-solace run sink-round-trip

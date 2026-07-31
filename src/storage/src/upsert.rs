@@ -230,8 +230,9 @@ mod columnar_upsert_key {
 /// source-render path: that path only ever needs `FromTime: UpsertSourceTime`.
 /// Only the relative order matters; the value is never read back.
 ///
-/// The upsert envelope is rendered for Kafka and the KEY VALUE load generator,
-/// so those source times (`KafkaTimestamp`, `MzOffset`) project to a real order
+/// The upsert envelope is rendered for Kafka, the KEY VALUE load generator, and
+/// Solace (`ENVELOPE UPSERT (KEY ...)`), so those source times
+/// (`KafkaTimestamp`, `MzOffset`, `SolaceTimestamp`) project to a real order
 /// key. The remaining source times implement the trait only for coherence on
 /// the generic render path — their sources never render upsert — so their
 /// projection is a panicking guard rather than a real key.
@@ -275,6 +276,29 @@ impl UpsertSourceTime for MzOffset {
     }
 }
 
+/// Solace source time. Solace renders the upsert envelope for
+/// `ENVELOPE UPSERT (KEY ...)` (the key is assembled from INCLUDE metadata
+/// columns), so this projects to a real order key. `SolaceTimestamp` is the
+/// raw 16-byte broker ReplicationGroupMessageId (or `None` before the first
+/// message), totally ordered as `None` < any `Some`, then byte-wise. The
+/// projection preserves that exact order: a presence flag first (so `None`
+/// sorts below every `Some`), then the two big-endian halves of the 16 bytes,
+/// whose lexicographic order equals the byte-wise order. RGMIDs increase with
+/// spool order within a queue, so "max order wins" is "latest update wins".
+impl UpsertSourceTime for SolaceTimestamp {
+    type Order = (u8, u64, u64);
+    fn upsert_order(&self) -> (u8, u64, u64) {
+        match self.0 {
+            None => (0, 0, 0),
+            Some(bytes) => {
+                let hi = u64::from_be_bytes(bytes[0..8].try_into().expect("8 bytes"));
+                let lo = u64::from_be_bytes(bytes[8..16].try_into().expect("8 bytes"));
+                (1, hi, lo)
+            }
+        }
+    }
+}
+
 /// Source times whose sources never render the upsert envelope (MySQL and SQL
 /// Server CDC). `Order = ()` keeps the generic render path free of any columnar
 /// requirement on the source time. The projection panics rather than returning:
@@ -295,7 +319,7 @@ macro_rules! upsert_source_time_unit {
         }
     )+};
 }
-upsert_source_time_unit!(GtidPartition, Lsn, SolaceTimestamp);
+upsert_source_time_unit!(GtidPartition, Lsn);
 
 /// Pager for the upsert-v2 source stash.
 ///

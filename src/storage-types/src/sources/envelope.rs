@@ -258,13 +258,16 @@ impl UnplannedSourceEnvelope {
                     ty
                 ),
             },
-            // MetadataKey sources never reach UnplannedSourceEnvelope::desc() —
-            // the planner's MetadataKey early-return path constructs SourceEnvelope directly.
+            // MetadataKey envelopes are planned directly: the planner constructs
+            // SourceEnvelope::Upsert itself and never calls desc() for them.
+            // Reaching here means a refactor routed a MetadataKey envelope through
+            // the generic path. Fail with context rather than panicking, so the
+            // mistake surfaces as a recoverable planning error.
             UnplannedSourceEnvelope::Upsert {
                 style: UpsertStyle::MetadataKey { .. },
-            } => unreachable!(
-                "MetadataKey sources are planned directly and should never \
-                 go through UnplannedSourceEnvelope::desc()"
+            } => bail!(
+                "MetadataKey upsert envelopes must be planned directly and cannot \
+                 be described through UnplannedSourceEnvelope::desc()"
             ),
             UnplannedSourceEnvelope::CdcV2 => {
                 // the correct types

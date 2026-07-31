@@ -521,13 +521,47 @@ fn upsert_commands<'scope, T: Timestamp, FromTime: Timestamp>(
             // Collect once so each key column is O(1) to index; avoids re-walking the datum
             // iterator O(idx) times for every key column on every message.
             let metadata_datums: Vec<Datum<'_>> = metadata.iter().collect();
+            // Assemble the key from the metadata columns. Two failure modes are
+            // handled distinctly. A NULL key column is a data condition: it
+            // yields UpsertError::NullKey, exactly as the stock path below treats
+            // a null decoded key. An out-of-bounds index is a structural invariant
+            // violation (the planner derives these indices by name from the same
+            // metadata desc the runtime row is built from), so it panics with
+            // context rather than silently substituting NULL and corrupting the key.
+            let mut key_is_null = false;
             {
                 let mut packer = row_buf.packer();
                 for &idx in key_metadata_indices.iter() {
-                    packer.push(metadata_datums.get(idx).copied().unwrap_or(Datum::Null));
+                    let datum = *metadata_datums.get(idx).unwrap_or_else(|| {
+                        panic!(
+                            "MetadataKey index {idx} out of bounds for metadata row \
+                             of arity {}; planner and runtime disagree on key layout",
+                            metadata_datums.len()
+                        )
+                    });
+                    if datum == Datum::Null {
+                        key_is_null = true;
+                    }
+                    packer.push(datum);
                 }
             }
             let key_row = row_buf.clone();
+
+            // A null key cannot participate in upsert. Emit a NullKey error keyed
+            // the same way the stock path does, so the error surfaces in the
+            // collection rather than a NULL silently acting as a valid key.
+            if key_is_null {
+                let err = UpsertError::NullKey(UpsertNullKeyError);
+                return match result.value {
+                    Some(_) => (
+                        UpsertKey::from_key(Err(&err)),
+                        Some(Err(Box::new(err))),
+                        from_time,
+                    ),
+                    None => (UpsertKey::from_key(Err(&err)), None, from_time),
+                };
+            }
+
             let upsert_key = UpsertKey::from_key(Ok(&key_row));
 
             let value = match result.value {
@@ -594,8 +628,9 @@ fn upsert_commands<'scope, T: Timestamp, FromTime: Timestamp>(
                 key_envelope: KeyEnvelope::None,
                 error_column: _,
             } => unreachable!(),
-            // MetadataKey is handled by the early-return above
-            UpsertStyle::MetadataKey { .. } => unreachable!(),
+            UpsertStyle::MetadataKey { .. } => unreachable!(
+                "MetadataKey is handled by the early-return at the top of upsert_commands"
+            ),
         };
 
         let key = UpsertKey::from_key(Ok(&key_row));
@@ -630,8 +665,9 @@ fn upsert_commands<'scope, T: Timestamp, FromTime: Timestamp>(
                     packer.extend_by_row(&metadata);
                     Some(Ok(row_buf.clone()))
                 }
-                // MetadataKey is handled by the early-return above
-                UpsertStyle::MetadataKey { .. } => unreachable!(),
+                UpsertStyle::MetadataKey { .. } => unreachable!(
+                    "MetadataKey is handled by the early-return at the top of upsert_commands"
+                ),
             },
             Some(Err(inner)) => {
                 match upsert_envelope.style {
