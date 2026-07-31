@@ -34,7 +34,7 @@
   IN CLUSTER quickstart
   FROM SOLACE CONNECTION solace_conn (QUEUE 'mz_upsert_q')
   FORMAT BYTES
-  INCLUDE TOPIC LEVELS AS tl (COUNT = 3)
+  INCLUDE TOPIC LEVELS (COUNT = 3) AS tl
   ENVELOPE UPSERT (KEY (tl_3));
 
 # Publish to topics mz/upsert/<key>. The queue's mz/upsert/> subscription
@@ -77,7 +77,7 @@ mz upsert
   IN CLUSTER quickstart
   FROM SOLACE CONNECTION solace_conn (QUEUE 'mz_upsert_null_q')
   FORMAT BYTES
-  INCLUDE TOPIC LEVELS AS tl (COUNT = 3)
+  INCLUDE TOPIC LEVELS (COUNT = 3) AS tl
   ENVELOPE UPSERT (KEY (tl_3));
 
 # Only two topic levels, so tl_3 is NULL -> the key is null.
