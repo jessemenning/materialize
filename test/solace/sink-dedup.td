@@ -13,11 +13,16 @@
 # DEDUP WINDOW conflates rather than drops: the first row publishes
 # immediately, rows arriving within the window are suppressed but the latest
 # suppressed payload is buffered and flushed once the window elapses, even if
-# no further rows arrive. So a rapid burst of three values yields exactly two
-# messages: the first value, then the last value of the burst (the middle one
-# is conflated away). The mzcompose workflow asserts both the count and that
-# the second message carries the latest value, proving conflation keeps the
-# newest payload and that a quiet stream still flushes.
+# no further rows arrive. So three values arriving over time within one window
+# yield exactly two messages: the first value, then the latest value (the
+# middle one is conflated away). The mzcompose workflow asserts both the count
+# and that the second message carries the latest value, proving conflation
+# keeps the newest payload and that a quiet stream still flushes.
+#
+# The three values are inserted in separate statements with gaps rather than a
+# single multi-row INSERT. Rows in one INSERT land at a single timestamp and
+# are logically concurrent, so "latest" among them is not well defined. The
+# realistic case, and the one this exercises, is updates arriving over time.
 #
 # The verification queue (mz_dedup_q) subscribed to 'mz/sink-test/dedup'
 # is provisioned by the mzcompose workflow before this script runs.
@@ -51,11 +56,20 @@
 
 $ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=2s
 
-# Three inserts in rapid succession — all within the 3 s dedup window.
-# val=1 publishes immediately. val=2 and val=3 are suppressed, with val=3
-# conflating over val=2 in the pending buffer.
-> INSERT INTO sink_dedup_events VALUES ('x', 1), ('x', 2), ('x', 3)
+# val=1 is the first row for this topic, so it publishes immediately and opens
+# the 3 s window.
+> INSERT INTO sink_dedup_events VALUES ('x', 1)
+
+# val=2 arrives ~0.8 s later, still inside the window, so it is suppressed and
+# buffered as the pending latest payload.
+$ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=800ms
+> INSERT INTO sink_dedup_events VALUES ('x', 2)
+
+# val=3 arrives ~0.8 s after that, still inside the window, so it conflates over
+# val=2 in the pending buffer.
+$ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=800ms
+> INSERT INTO sink_dedup_events VALUES ('x', 3)
 
 # Wait for the dedup window to elapse. No further rows arrive, so this also
 # exercises the timer-driven flush of the buffered latest payload (val=3).
-$ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=5s
+$ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=4s

@@ -469,13 +469,14 @@ def workflow_sink_round_trip(c: Composition, parser: WorkflowArgumentParser) -> 
 def workflow_sink_dedup(c: Composition, parser: WorkflowArgumentParser) -> None:
     """Dedup-window test for the Solace sink.
 
-    Three rows (val 1, 2, 3) inserted rapidly all map to the same rendered
+    Three values (1, 2, 3) inserted over time all map to the same rendered
     topic within a 3 s DEDUP WINDOW. val=1 publishes immediately; val=2 and
-    val=3 are suppressed, with val=3 conflating over val=2. When the window
-    elapses the buffered latest payload (val=3) is flushed by the timer even
-    though no further rows arrive. Verifies exactly 2 messages and that the
-    second carries the latest value, proving conflation keeps the newest
-    payload and that a quiet stream still flushes.
+    val=3 arrive while the window is open and are suppressed, with val=3
+    conflating over val=2. When the window elapses the buffered latest payload
+    (val=3) is flushed by the timer even though no further rows arrive.
+    Verifies exactly 2 messages and that the second carries the latest value,
+    proving conflation keeps the newest payload and that a quiet stream still
+    flushes.
     """
     parser.parse_args()
 
