@@ -469,9 +469,13 @@ def workflow_sink_round_trip(c: Composition, parser: WorkflowArgumentParser) -> 
 def workflow_sink_dedup(c: Composition, parser: WorkflowArgumentParser) -> None:
     """Dedup-window test for the Solace sink.
 
-    Three rows inserted rapidly all map to the same rendered topic so only
-    the first is published within the window. After the window expires a
-    fourth insert produces a second publish. Verifies exactly 2 messages.
+    Three rows (val 1, 2, 3) inserted rapidly all map to the same rendered
+    topic within a 3 s DEDUP WINDOW. val=1 publishes immediately; val=2 and
+    val=3 are suppressed, with val=3 conflating over val=2. When the window
+    elapses the buffered latest payload (val=3) is flushed by the timer even
+    though no further rows arrive. Verifies exactly 2 messages and that the
+    second carries the latest value, proving conflation keeps the newest
+    payload and that a quiet stream still flushes.
     """
     parser.parse_args()
 
@@ -484,8 +488,13 @@ def workflow_sink_dedup(c: Composition, parser: WorkflowArgumentParser) -> None:
 
     messages = consume_from_queue(c, "mz_dedup_q", exit_after=12)
     assert len(messages) == 2, (
-        f"Expected exactly 2 messages (dedup suppressed rapid duplicates), "
-        f"got {len(messages)}.\nMessages: {messages}"
+        f"Expected exactly 2 messages (dedup conflated the middle value and "
+        f"flushed the latest), got {len(messages)}.\nMessages: {messages}"
+    )
+    vals = [json.loads(m["payload"])["val"] for m in messages]
+    assert vals == [1, 3], (
+        f"Expected values [1, 3] (first published, then conflated latest "
+        f"flushed), got {vals}.\nMessages: {messages}"
     )
     print("sink_dedup: PASSED")
 
@@ -566,11 +575,13 @@ def workflow_sink_reconnect(c: Composition, parser: WorkflowArgumentParser) -> N
     # re-establish the session after the broker healthcheck passes.
     time.sleep(5)
 
-    # Drain any during-outage rows that the sink replays after reconnect.
-    # The Materialize sink checkpoints progress; after broker reconnect it
-    # replays from the last persisted watermark, which may include rows that
-    # were committed to Materialize while the broker was down. Drain these
-    # so the Phase 4 assertion only sees post-restart messages.
+    # Drain any rows the sink emits right after reconnect. Direct delivery is
+    # fire-and-forget with no durable output watermark, so rows produced while
+    # the broker was down are not durably replayed. But rows still in flight
+    # through the dataflow when the session re-establishes will publish, and
+    # the buffered latest payload of any active dedup window flushes on its
+    # timer. Drain these so the Phase 4 assertion only sees post-restart
+    # messages.
     consume_from_queue(c, "mz_reconnect_q", exit_after=8)
 
     # Phase 4: publish after reconnect and verify.

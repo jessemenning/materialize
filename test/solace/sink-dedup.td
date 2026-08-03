@@ -8,10 +8,16 @@
 # by the Apache License, Version 2.0.
 
 # Dedup-window test for the Solace sink. The sink is created with a 3 s
-# DEDUP WINDOW. Three rows inserted rapidly all render to the same topic
-# ('mz/sink-test/dedup'), so only the first is published within the window.
-# After the window expires a fourth insert produces a second publish. The
-# mzcompose workflow verifies exactly 2 messages arrive in Solace.
+# DEDUP WINDOW. All rows render to the same topic ('mz/sink-test/dedup').
+#
+# DEDUP WINDOW conflates rather than drops: the first row publishes
+# immediately, rows arriving within the window are suppressed but the latest
+# suppressed payload is buffered and flushed once the window elapses, even if
+# no further rows arrive. So a rapid burst of three values yields exactly two
+# messages: the first value, then the last value of the burst (the middle one
+# is conflated away). The mzcompose workflow asserts both the count and that
+# the second message carries the latest value, proving conflation keeps the
+# newest payload and that a quiet stream still flushes.
 #
 # The verification queue (mz_dedup_q) subscribed to 'mz/sink-test/dedup'
 # is provisioned by the mzcompose workflow before this script runs.
@@ -32,7 +38,7 @@
 
 # Single column used as the dedup key: every row maps to the same rendered
 # topic ('mz/sink-test/dedup'), so successive inserts within the window are
-# suppressed.
+# suppressed and conflated.
 > CREATE TABLE sink_dedup_events (key TEXT, val INT)
 
 > CREATE SINK sink_dedup
@@ -46,16 +52,10 @@
 $ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=2s
 
 # Three inserts in rapid succession — all within the 3 s dedup window.
-# Only the first triggers a publish; the next two are suppressed.
+# val=1 publishes immediately. val=2 and val=3 are suppressed, with val=3
+# conflating over val=2 in the pending buffer.
 > INSERT INTO sink_dedup_events VALUES ('x', 1), ('x', 2), ('x', 3)
 
-$ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=500ms
-
-# Wait for the dedup window to expire (3 s window + headroom).
-$ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=4s
-
-# This insert arrives after the window; a second publish should go out.
-> INSERT INTO sink_dedup_events VALUES ('x', 4)
-
-# Give the sink time to process and publish the post-window row.
-$ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=2s
+# Wait for the dedup window to elapse. No further rows arrive, so this also
+# exercises the timer-driven flush of the buffered latest payload (val=3).
+$ sleep-is-probably-flaky-i-have-justified-my-need-with-a-comment duration=5s
