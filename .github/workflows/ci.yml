@@ -212,6 +212,10 @@ jobs:
         if: success()
         run: ./bin/mzcompose --find solace --dev --image-registry ghcr.io/jessemenning/materialize-solace run sink-dynamic-topic
 
+      - name: Run sink-mv workflow
+        if: success()
+        run: ./bin/mzcompose --find solace --dev --image-registry ghcr.io/jessemenning/materialize-solace run sink-mv
+
       - name: Run sink-reconnect workflow
         if: success()
         run: ./bin/mzcompose --find solace --dev --image-registry ghcr.io/jessemenning/materialize-solace run sink-reconnect

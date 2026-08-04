@@ -538,6 +538,54 @@ def workflow_sink_dynamic_topic(c: Composition, parser: WorkflowArgumentParser) 
     print("sink_dynamic_topic: PASSED")
 
 
+def workflow_sink_mv(c: Composition, parser: WorkflowArgumentParser) -> None:
+    """Materialized-view-fed sink test: continuous change and NULL topics.
+
+    Reproduces the scenario behind the sink's original silence bug. Phase 1
+    feeds the sink a running-total materialized view updated in four separate
+    statements and asserts all four totals (10, 30, 60, 100) are published, so
+    delivery continues past the initial snapshot. The testdrive script also
+    asserts the sink's write frontier advances in mz_frontiers. Phase 2 feeds a
+    view whose topic column is NULL for one row and asserts that row is dropped
+    while the other two publish.
+    """
+    parser.parse_args()
+
+    ensure_vm_max_map_count(c)
+    c.up("solace", "materialized", "stm")
+    provision_broker(c)
+    provision_sink_queues(
+        c,
+        [
+            ("mz_mv_q", "mz/sink-test/mv"),
+            ("mz_mv_null_q", "mz/sink-test/mv-null/>"),
+        ],
+    )
+
+    c.run_testdrive_files("sink-mv.td")
+
+    # Phase 1: every update to the running total must publish, proving the sink
+    # keeps delivering after its snapshot rather than going silent.
+    totals = consume_from_queue(c, "mz_mv_q")
+    total_vals = sorted(json.loads(m["payload"])["total"] for m in totals)
+    assert total_vals == [10, 30, 60, 100], (
+        f"Expected running totals [10, 30, 60, 100] from continuous MV updates "
+        f"(sink kept delivering past snapshot), got {total_vals}.\n"
+        f"Messages: {totals}"
+    )
+
+    # Phase 2: the NULL-region row is dropped; the other two publish on their
+    # per-region topics.
+    regions = consume_from_queue(c, "mz_mv_null_q")
+    region_topics = sorted(m["topic"] for m in regions if m["topic"])
+    expected = sorted(["mz/sink-test/mv-null/north", "mz/sink-test/mv-null/south"])
+    assert region_topics == expected, (
+        f"Expected two per-region topics (NULL region dropped), "
+        f"got {region_topics}.\nMessages: {regions}"
+    )
+    print("sink_mv: PASSED")
+
+
 def workflow_sink_reconnect(c: Composition, parser: WorkflowArgumentParser) -> None:
     """Broker reconnect test for the Solace sink.
 
