@@ -33,16 +33,20 @@ use std::time::{Duration, Instant};
 
 use itertools::Itertools as _;
 
-use differential_dataflow::VecCollection;
+use differential_dataflow::{Hashable, VecCollection};
 use futures::StreamExt;
 use mz_interchange::avro::DiffPair;
 use mz_interchange::envelopes::for_each_diff_pair;
 use mz_ore::cast::CastFrom;
 use mz_ore::error::ErrorExt;
+use mz_persist_client::Diagnostics;
+use mz_persist_types::codec_impls::UnitSchema;
 use mz_repr::{Datum, Diff, GlobalId, RelationDesc, Row, Timestamp};
+use mz_storage_types::StorageDiff;
 use mz_storage_types::controller::CollectionMetadata;
 use mz_storage_types::errors::DataflowError;
 use mz_storage_types::sinks::{SolaceSinkConnection, StorageSinkDesc};
+use mz_storage_types::sources::SourceData;
 use mz_timely_util::builder_async::{
     Event, OperatorBuilder as AsyncOperatorBuilder, PressOnDropButton,
 };
@@ -53,6 +57,7 @@ use solace_rs::context::Context;
 use solace_rs::message::{
     DeliveryMode, DestinationType, MessageDestination, OutboundMessage, OutboundMessageBuilder,
 };
+use timely::PartialOrder;
 use timely::container::CapacityContainerBuilder;
 use timely::dataflow::StreamVec;
 use timely::progress::{Antichain, Timestamp as _};
@@ -73,7 +78,7 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
     fn render_sink(
         &self,
         storage_state: &mut StorageState,
-        _sink: &StorageSinkDesc<CollectionMetadata, Timestamp>,
+        sink: &StorageSinkDesc<CollectionMetadata, Timestamp>,
         sink_id: GlobalId,
         batches: SinkBatchStream<'scope>,
         _key_is_synthetic: bool,
@@ -89,6 +94,34 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                 .connection_context
                 .secrets_reader,
         );
+
+        // Durable progress lives in the sink's (data-less) persist shard: one
+        // worker advances the shard upper with empty appends as input progress
+        // arrives, mirroring the Kafka sink. `StorageCollections` watches the
+        // shard upper, which is what `mz_frontiers` reports and what restart
+        // as_of derivation reads, so without these appends the sink appears
+        // frozen at 0 and re-snapshots from scratch on every restart. The
+        // shared in-memory frontier below is NOT sufficient for this: it only
+        // feeds the controller's read-hold downgrades and dies with the
+        // process.
+        let progress_leader =
+            usize::cast_from(sink_id.hashed()) % batches.scope().peers() == batches.scope().index();
+        let progress_handle = progress_leader.then(|| {
+            let persist = std::sync::Arc::clone(&storage_state.persist_clients);
+            let shard_meta = sink.to_storage_metadata.clone();
+            async move {
+                let client = persist.open(shard_meta.persist_location).await?;
+                let handle = client
+                    .open_writer::<SourceData, (), Timestamp, StorageDiff>(
+                        shard_meta.data_shard,
+                        std::sync::Arc::new(shard_meta.relation_desc),
+                        std::sync::Arc::new(UnitSchema),
+                        Diagnostics::from_purpose("sink handle"),
+                    )
+                    .await?;
+                Ok::<_, anyhow::Error>(handle)
+            }
+        });
 
         // Replace the placeholder write frontier registered by the storage
         // state with one this operator drives. Without this the frontier
@@ -134,6 +167,13 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                         "Solace sink: failed to read PASSWORD secret: {}",
                         err.display_with_causes()
                     );
+                    // NOTE: every abort must clear the shared frontier to the
+                    // empty antichain (Kafka does the same). A worker that
+                    // returns with the frontier still at `minimum()` pins the
+                    // sink's reported upper at 0, which holds the input's read
+                    // hold at the as_of forever and lets the shard grow
+                    // without bound.
+                    write_frontier.borrow_mut().clear();
                     return;
                 }
             };
@@ -146,6 +186,7 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                         "Solace sink: failed to initialize context: {}",
                         err.display_with_causes()
                     );
+                    write_frontier.borrow_mut().clear();
                     return;
                 }
             };
@@ -181,11 +222,31 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                         "Solace sink: failed to open session to {host} (vpn {msg_vpn}): {}",
                         err.display_with_causes()
                     );
+                    write_frontier.borrow_mut().clear();
                     return;
                 }
             };
 
             tracing::info!(sink_id = %sink_id, "Solace sink connected to {host} (vpn {msg_vpn})");
+
+            // The progress leader opens its persist writer only after the
+            // broker session is up, so a sink that cannot connect never
+            // advances durable progress past data it has not published.
+            let mut progress_handle = match progress_handle {
+                Some(open) => match open.await {
+                    Ok(handle) => Some(handle),
+                    Err(err) => {
+                        tracing::warn!(
+                            sink_id = %sink_id,
+                            "Solace sink: failed to open persist progress handle: {}",
+                            err.display_with_causes()
+                        );
+                        write_frontier.borrow_mut().clear();
+                        return;
+                    }
+                },
+                None => None,
+            };
 
             // Signal running so Materialize transitions out of `starting`.
             if let Some(ref cap) = health_cap {
@@ -255,12 +316,35 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                         // output, so input progress is an honest at-most-once
                         // write frontier. Reporting it lets the controller
                         // downgrade the sink's read hold on its input, which
-                        // unblocks upstream compaction and avoids a full
-                        // re-snapshot on restart. Payloads still buffered in
-                        // `pending` are deliberately not accounted for:
-                        // losing them on restart is within the at-most-once
-                        // contract.
+                        // unblocks upstream compaction. Payloads still
+                        // buffered in `pending` are deliberately not accounted
+                        // for: losing them on restart is within the
+                        // at-most-once contract.
                         write_frontier.borrow_mut().clone_from(&frontier);
+
+                        // The progress leader also records progress durably by
+                        // advancing the sink's persist shard upper with empty
+                        // appends, mirroring the Kafka sink. This is what
+                        // `mz_frontiers` reports (`StorageCollections` watches
+                        // the shard upper, not the in-memory frontier above)
+                        // and what restart as_of derivation reads, so it is
+                        // what prevents a full re-snapshot on every restart.
+                        // Input timestamps tick at the 1s timestamp_interval,
+                        // so this costs about one consensus write per second.
+                        if let Some(handle) = progress_handle.as_mut() {
+                            let mut expect_upper = handle.shared_upper();
+                            while PartialOrder::less_than(&expect_upper, &frontier) {
+                                const EMPTY: &[((SourceData, ()), Timestamp, StorageDiff)] = &[];
+                                match handle
+                                    .compare_and_append(EMPTY, expect_upper, frontier.clone())
+                                    .await
+                                    .expect("valid usage")
+                                {
+                                    Ok(()) => break,
+                                    Err(mismatch) => expect_upper = mismatch.current,
+                                }
+                            }
+                        }
                     }
                     Some(Some(Event::Data(_cap, mut batches))) => {
                         to_publish.clear();
