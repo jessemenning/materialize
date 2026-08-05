@@ -31,7 +31,7 @@ contains:QUEUE and DURABLE TOPIC ENDPOINT are mutually exclusive
 
 # Neither QUEUE nor DTE.
 ! CREATE SOURCE bad IN CLUSTER quickstart
-  FROM SOLACE CONNECTION solace_conn ()
+  FROM SOLACE CONNECTION solace_conn
   FORMAT BYTES
 contains:Solace source requires exactly one of QUEUE or DURABLE TOPIC ENDPOINT
 
@@ -91,7 +91,7 @@ contains:key column "nonexistent" not found in source metadata
 
 # Missing TOPIC.
 ! CREATE SINK bad IN CLUSTER quickstart
-  FROM t INTO SOLACE CONNECTION solace_conn ()
+  FROM t INTO SOLACE CONNECTION solace_conn
 contains:Solace sink must specify TOPIC
 
 # Unknown column in the topic template.
