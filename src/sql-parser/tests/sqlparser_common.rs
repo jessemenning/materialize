@@ -1145,4 +1145,11 @@ fn postfix_access_receiver_reparenthesized_after_nested_stripped() {
 fn test_solace_sink_parse() {
     let sql = "CREATE SINK s IN CLUSTER c FROM v INTO SOLACE CONNECTION sc (TOPIC 't');";
     assert_ok!(parse_statements(sql), "SOLACE sink should parse");
+
+    let sql = "CREATE SINK s IN CLUSTER c FROM v INTO SOLACE CONNECTION sc \
+               (TOPIC 't', DELIVERY MODE 'persistent');";
+    assert_ok!(
+        parse_statements(sql),
+        "SOLACE sink with DELIVERY MODE should parse"
+    );
 }

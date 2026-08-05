@@ -22,7 +22,7 @@
 #   cache.
 #
 #   Source workflows: negative, round-trip, exactly-once
-#   Sink workflows:  sink-round-trip, sink-dedup, sink-dynamic-topic, sink-reconnect
+#   Sink workflows:  sink-round-trip, sink-persistent, sink-dedup, sink-dynamic-topic, sink-reconnect
 #
 # Upstream Materialize CI runs on Buildkite (`ci/test/pipeline.template.yml`),
 # which doesn't run on private forks; this is the GHA equivalent scoped to
@@ -207,6 +207,10 @@ jobs:
       - name: Run sink-round-trip workflow
         if: success()
         run: ./bin/mzcompose --find solace --dev --image-registry ghcr.io/jessemenning/materialize-solace run sink-round-trip
+
+      - name: Run sink-persistent workflow
+        if: success()
+        run: ./bin/mzcompose --find solace --dev --image-registry ghcr.io/jessemenning/materialize-solace run sink-persistent
 
       - name: Run sink-dedup workflow
         if: success()

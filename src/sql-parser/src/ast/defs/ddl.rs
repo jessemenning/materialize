@@ -1843,6 +1843,7 @@ pub enum CreateSinkConnection<T: AstInfo> {
 pub enum SolaceSinkConfigOptionName {
     Topic,
     DedupWindow,
+    DeliveryMode,
 }
 
 impl AstDisplay for SolaceSinkConfigOptionName {
@@ -1850,6 +1851,7 @@ impl AstDisplay for SolaceSinkConfigOptionName {
         f.write_str(match self {
             SolaceSinkConfigOptionName::Topic => "TOPIC",
             SolaceSinkConfigOptionName::DedupWindow => "DEDUP WINDOW",
+            SolaceSinkConfigOptionName::DeliveryMode => "DELIVERY MODE",
         })
     }
 }

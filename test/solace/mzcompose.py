@@ -479,6 +479,40 @@ def workflow_sink_round_trip(c: Composition, parser: WorkflowArgumentParser) -> 
     print("sink_round_trip: PASSED")
 
 
+def workflow_sink_persistent(c: Composition, parser: WorkflowArgumentParser) -> None:
+    """Persistent (guaranteed) delivery test for the Solace sink.
+
+    Creates a sink with DELIVERY MODE 'persistent', inserts five rows, and
+    verifies all five arrive on the verification queue. The sink gates its
+    write frontier on broker acks, so the testdrive script also asserts the
+    frontier advances past 0 (which only happens once the acks arrive).
+    """
+    parser.parse_args()
+
+    ensure_vm_max_map_count(c)
+    c.up("solace", "materialized", "stm")
+    provision_broker(c)
+    provision_sink_queues(c, [("mz_sink_persistent_q", "mz/sink-test/persistent")])
+
+    c.run_testdrive_files("sink-persistent.td")
+
+    messages = consume_from_queue(c, "mz_sink_persistent_q")
+    assert len(messages) == 5, (
+        f"Expected 5 messages from persistent sink, got {len(messages)}.\n"
+        f"Messages: {messages}"
+    )
+    payloads = [json.loads(m["payload"]) for m in messages]
+    labels = sorted(p["label"] for p in payloads)
+    assert labels == [
+        "bar",
+        "baz",
+        "foo",
+        "hello",
+        "world",
+    ], f"Unexpected labels: {labels}"
+    print("sink_persistent: PASSED")
+
+
 def workflow_sink_dedup(c: Composition, parser: WorkflowArgumentParser) -> None:
     """Dedup-window test for the Solace sink.
 

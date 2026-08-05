@@ -108,3 +108,13 @@ contains:FORMAT is not supported for Solace sinks
 ! CREATE SINK bad IN CLUSTER quickstart
   FROM t INTO SOLACE CONNECTION solace_conn (TOPIC 'events') ENVELOPE UPSERT
 contains:ENVELOPE is not supported for Solace sinks
+
+# DELIVERY MODE must be direct or persistent.
+! CREATE SINK bad IN CLUSTER quickstart
+  FROM t INTO SOLACE CONNECTION solace_conn (TOPIC 'events', DELIVERY MODE 'bogus')
+contains:DELIVERY MODE must be direct or persistent
+
+# Persistent delivery cannot be combined with a dedup window.
+! CREATE SINK bad IN CLUSTER quickstart
+  FROM t INTO SOLACE CONNECTION solace_conn (TOPIC 'events', DELIVERY MODE 'persistent', DEDUP WINDOW '3s')
+contains:DEDUP WINDOW is not supported with DELIVERY MODE persistent

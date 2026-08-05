@@ -50,8 +50,17 @@ generate_extracted_config!(
     (AckMode, String, Default(DEFAULT_ACK_MODE.to_string()))
 );
 
+/// Default sink delivery mode. "direct" is fire-and-forget (at-most-once);
+/// "persistent" waits for broker acknowledgement (at-least-once).
+pub const DEFAULT_DELIVERY_MODE: &str = "direct";
+
 generate_extracted_config!(
     SolaceSinkConfigOption,
     (Topic, String),
-    (DedupWindow, OptionalDuration)
+    (DedupWindow, OptionalDuration),
+    (
+        DeliveryMode,
+        String,
+        Default(DEFAULT_DELIVERY_MODE.to_string())
+    )
 );

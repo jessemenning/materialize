@@ -19,10 +19,18 @@
 //!
 //! # Delivery semantics
 //!
-//! Delivery is fire-and-forget Direct messaging with no durable output shard,
-//! so the sink is at-most-once: the write frontier follows the input frontier
-//! once batches have been handed to the Solace session, whether or not the
-//! broker received them. Two caveats sharpen that contract:
+//! `DELIVERY MODE` selects the guarantee. In `direct` (the default) delivery
+//! is fire-and-forget Direct messaging: the write frontier follows the input
+//! frontier once batches have been handed to the Solace session, whether or
+//! not the broker received them, so the sink is at-most-once. In `persistent`
+//! mode each message is published with a broker acknowledgement, and the
+//! frontier (and durable shard upper) advance only past data the broker has
+//! acked. A restart resumes from that confirmed upper and re-publishes
+//! anything unacked, so the sink is at-least-once. An ack failure halts the
+//! sink so the dataflow restarts and replays.
+//!
+//! The following caveats apply to direct mode (persistent mode confirms
+//! delivery, so they do not):
 //!
 //! * **Restart duplicate window.** On restart the sink resumes from its
 //!   durable shard upper, but the dataflow as_of trails it (it is the sink's
@@ -58,12 +66,13 @@ use mz_repr::{Datum, Diff, GlobalId, RelationDesc, Row, Timestamp};
 use mz_storage_types::StorageDiff;
 use mz_storage_types::controller::CollectionMetadata;
 use mz_storage_types::errors::DataflowError;
-use mz_storage_types::sinks::{SolaceSinkConnection, StorageSinkDesc};
+use mz_storage_types::sinks::{SolaceDeliveryMode, SolaceSinkConnection, StorageSinkDesc};
 use mz_storage_types::sources::SourceData;
 use mz_timely_util::builder_async::{
     AsyncOutputHandle, Event, OperatorBuilder as AsyncOperatorBuilder, PressOnDropButton,
 };
 use serde_json::Value;
+use solace_rs::SessionError;
 use solace_rs::SolaceLogLevel;
 use solace_rs::async_support::{AsyncSession, AsyncSessionBuilder};
 use solace_rs::context::Context;
@@ -76,6 +85,7 @@ use timely::container::CapacityContainerBuilder;
 use timely::dataflow::StreamVec;
 use timely::dataflow::operators::Capability;
 use timely::progress::{Antichain, Timestamp as _};
+use tokio::sync::oneshot;
 
 use crate::healthcheck::{HealthStatusMessage, HealthStatusUpdate, StatusNamespace};
 use crate::render::sinks::{SinkBatchStream, SinkRender};
@@ -320,10 +330,10 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
 
             // Dedup state: rendered topic -> time of the last actual publish.
             let mut dedup_cache: BTreeMap<String, Instant> = BTreeMap::new();
-            // Latest payload per topic suppressed by the dedup window,
-            // awaiting flush. Newer suppressed payloads replace older ones
-            // (conflation), so at most one payload per topic is pending.
-            let mut pending: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+            // Latest (input time, payload) per topic suppressed by the dedup
+            // window, awaiting flush. Newer suppressed payloads replace older
+            // ones (conflation), so at most one payload per topic is pending.
+            let mut pending: BTreeMap<String, (Timestamp, Vec<u8>)> = BTreeMap::new();
 
             let mut drop_stats = DropStats::new();
 
@@ -331,9 +341,12 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                 session,
                 sink_id,
                 statistics,
+                mode: connection.delivery_mode,
                 msgs: Vec::new(),
                 staged_bytes: 0,
+                pending_acks: Vec::new(),
                 consecutive_failures: 0,
+                fatal: None,
             };
 
             // Reusable buffers declared outside the event loop so their heap
@@ -414,42 +427,59 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                     None => {}
                     Some(None) => input_closed = true,
                     Some(Some(Event::Progress(frontier))) => {
-                        // Direct delivery is fire-and-forget with no durable
-                        // output, so input progress is an honest at-most-once
-                        // write frontier. Reporting it lets the controller
-                        // downgrade the sink's read hold on its input, which
-                        // unblocks upstream compaction. Payloads still
-                        // buffered in `pending` are deliberately not accounted
-                        // for: losing them on restart is within the
-                        // at-most-once contract.
-                        write_frontier.borrow_mut().clone_from(&frontier);
+                        // In persistent mode, wait for the broker to ack every
+                        // message below the new frontier before advancing. On
+                        // an ack failure this sets `publisher.fatal` and leaves
+                        // the frontier where it was, so the halt below restarts
+                        // the dataflow and replays from the last confirmed
+                        // upper (at-least-once). Direct mode is a no-op here:
+                        // input progress is an honest at-most-once frontier
+                        // since delivery is fire-and-forget.
+                        publisher.confirm_through(&frontier).await;
 
-                        // The progress leader also records progress durably by
-                        // advancing the sink's persist shard upper with empty
-                        // appends, mirroring the Kafka sink. This is what
-                        // `mz_frontiers` reports (`StorageCollections` watches
-                        // the shard upper, not the in-memory frontier above)
-                        // and what restart as_of derivation reads, so it is
-                        // what prevents a full re-snapshot on every restart.
-                        // Input timestamps tick at the 1s timestamp_interval,
-                        // so this costs about one consensus write per second.
-                        //
-                        // NOTE: the leader's input frontier is not a fleet-wide
-                        // lower bound: a slower peer worker can still hold
-                        // unpublished updates below it, which a crash at the
-                        // wrong moment then skips on restart. That widens the
-                        // at-most-once loss window beyond in-flight messages.
-                        if let Some(handle) = progress_handle.as_mut() {
-                            let mut expect_upper = handle.shared_upper();
-                            while PartialOrder::less_than(&expect_upper, &frontier) {
-                                const EMPTY: &[((SourceData, ()), Timestamp, StorageDiff)] = &[];
-                                match handle
-                                    .compare_and_append(EMPTY, expect_upper, frontier.clone())
-                                    .await
-                                    .expect("valid usage")
-                                {
-                                    Ok(()) => break,
-                                    Err(mismatch) => expect_upper = mismatch.current,
+                        // Advance only when delivery is confirmed. On a fatal
+                        // persistent-mode failure the frontier stays put and
+                        // the handler below halts, so the restart replays from
+                        // the last confirmed upper (at-least-once).
+                        if publisher.fatal.is_none() {
+                            // Reporting the frontier lets the controller
+                            // downgrade the sink's read hold on its input,
+                            // unblocking upstream compaction. In direct mode,
+                            // payloads still buffered in `pending` are
+                            // deliberately not accounted for: losing them on
+                            // restart is within the at-most-once contract.
+                            write_frontier.borrow_mut().clone_from(&frontier);
+
+                            // The progress leader also records progress durably
+                            // by advancing the sink's persist shard upper with
+                            // empty appends, mirroring the Kafka sink. This is
+                            // what `mz_frontiers` reports (`StorageCollections`
+                            // watches the shard upper, not the in-memory
+                            // frontier above) and what restart as_of derivation
+                            // reads, so it is what prevents a full re-snapshot
+                            // on every restart. Input timestamps tick at the 1s
+                            // timestamp_interval, so this costs about one
+                            // consensus write per second.
+                            //
+                            // NOTE: the leader's input frontier is not a
+                            // fleet-wide lower bound: a slower peer worker can
+                            // still hold unpublished updates below it, which a
+                            // crash at the wrong moment then skips on restart.
+                            // In direct mode that widens the at-most-once loss
+                            // window beyond in-flight messages.
+                            if let Some(handle) = progress_handle.as_mut() {
+                                let mut expect_upper = handle.shared_upper();
+                                while PartialOrder::less_than(&expect_upper, &frontier) {
+                                    const EMPTY: &[((SourceData, ()), Timestamp, StorageDiff)] =
+                                        &[];
+                                    match handle
+                                        .compare_and_append(EMPTY, expect_upper, frontier.clone())
+                                        .await
+                                        .expect("valid usage")
+                                    {
+                                        Ok(()) => break,
+                                        Err(mismatch) => expect_upper = mismatch.current,
+                                    }
                                 }
                             }
                         }
@@ -491,9 +521,9 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                         // sort is stable, preserving within-time order.
                         to_publish.sort_by_key(|(time, _, _)| *time);
 
-                        for (_time, topic, payload) in to_publish.drain(..) {
+                        for (time, topic, payload) in to_publish.drain(..) {
                             let Some(window) = connection.dedup_window else {
-                                publisher.stage(&topic, payload).await;
+                                publisher.stage(time, &topic, payload).await;
                                 continue;
                             };
                             let now = Instant::now();
@@ -508,18 +538,21 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                                     drop_stats.conflated += 1;
                                 }
                                 note_published(&mut dedup_cache, &topic, now, window);
-                                publisher.stage(&topic, payload).await;
+                                publisher.stage(time, &topic, payload).await;
                             } else {
-                                if pending.insert(topic, payload).is_some() {
+                                // Keep the latest payload (and its time) per
+                                // topic. Rows arrive time-sorted, so a later
+                                // insert never lowers the recorded time.
+                                if pending.insert(topic, (time, payload)).is_some() {
                                     drop_stats.conflated += 1;
                                 }
                                 // Bound memory on high-cardinality topic
                                 // spaces by flushing everything early rather
                                 // than dropping payloads.
                                 if pending.len() >= MAX_DEDUP_CACHE_ENTRIES {
-                                    for (topic, payload) in std::mem::take(&mut pending) {
+                                    for (topic, (time, payload)) in std::mem::take(&mut pending) {
                                         note_published(&mut dedup_cache, &topic, now, window);
-                                        publisher.stage(&topic, payload).await;
+                                        publisher.stage(time, &topic, payload).await;
                                     }
                                 }
                             }
@@ -547,14 +580,28 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                         .cloned()
                         .collect();
                     for topic in due {
-                        let payload = pending.remove(&topic).expect("due topic is pending");
+                        let (time, payload) = pending.remove(&topic).expect("due topic is pending");
                         note_published(&mut dedup_cache, &topic, now, window);
-                        publisher.stage(&topic, payload).await;
+                        publisher.stage(time, &topic, payload).await;
                     }
                 }
 
                 // Publish anything staged below the chunk boundary.
                 publisher.flush().await;
+
+                // An unrecoverable persistent-mode failure halts the sink so
+                // the dataflow restarts and replays from the last confirmed
+                // upper. The frontier was not advanced past the failed data.
+                if let Some(error) = publisher.fatal.take() {
+                    emit_sink_health(
+                        &health_output,
+                        &health_cap,
+                        sink_id,
+                        HealthStatusUpdate::halting(error, None),
+                    );
+                    std::future::pending::<()>().await;
+                    unreachable!("pending future never returns");
+                }
 
                 // Persistent publish failure (with a live session) surfaces as
                 // a stalled status; recovery flips back to running.
@@ -668,25 +715,42 @@ fn report_health(
     }
 }
 
-/// Stages outbound messages and publishes them in bounded chunks on a
-/// blocking thread.
+/// Publishes staged rows to the broker. In `Direct` mode messages are batched
+/// and sent fire-and-forget in bounded chunks. In `Persistent` mode each
+/// message is published with a broker acknowledgement, and the acks gate how
+/// far the sink's frontier may advance (see [`Publisher::confirm_through`]).
 struct Publisher {
     session: Arc<AsyncSession>,
     sink_id: GlobalId,
     statistics: SinkStatistics,
+    mode: SolaceDeliveryMode,
+    /// Direct-mode staging buffer, flushed in [`PUBLISH_CHUNK`]-sized chunks.
     msgs: Vec<OutboundMessage>,
     staged_bytes: u64,
-    /// Consecutive failed `publish_multiple` calls, reset on success. Drives
-    /// the stalled health status via [`report_health`].
+    /// Persistent-mode outstanding acks, tagged with the input timestamp of
+    /// the row that produced them. Ordered by insertion (broker order).
+    pending_acks: Vec<(Timestamp, oneshot::Receiver<Result<(), SessionError>>)>,
+    /// Consecutive failed Direct `publish_multiple` calls, reset on success.
+    /// Drives the stalled health status via [`report_health`]. Persistent-mode
+    /// failures halt instead (see [`Publisher::fatal`]).
     consecutive_failures: u64,
+    /// Set when a persistent publish or ack fails unrecoverably. The event
+    /// loop halts on this, so the dataflow restarts and replays from the last
+    /// confirmed (durable) upper.
+    fatal: Option<String>,
 }
 
 impl Publisher {
-    /// Build a Direct-delivery message for `topic` and stage it, flushing
-    /// when a full chunk has accumulated. Rows whose topic or message cannot
-    /// be built are dropped with a warning.
-    async fn stage(&mut self, topic: &str, payload: Vec<u8>) {
+    /// Build a message for `topic` and stage (Direct) or publish-with-ack
+    /// (Persistent) it. `time` is the input timestamp of the row, used in
+    /// persistent mode to gate the frontier. Rows whose topic or message
+    /// cannot be built are dropped with a warning.
+    async fn stage(&mut self, time: Timestamp, topic: &str, payload: Vec<u8>) {
         let payload_len = u64::cast_from(payload.len());
+        let delivery_mode = match self.mode {
+            SolaceDeliveryMode::Direct => DeliveryMode::Direct,
+            SolaceDeliveryMode::Persistent => DeliveryMode::Persistent,
+        };
         let dest = match MessageDestination::new(DestinationType::Topic, topic) {
             Ok(d) => d,
             Err(err) => {
@@ -697,16 +761,13 @@ impl Publisher {
                 return;
             }
         };
-        match OutboundMessageBuilder::new()
-            .delivery_mode(DeliveryMode::Direct)
+        let message = match OutboundMessageBuilder::new()
+            .delivery_mode(delivery_mode)
             .destination(dest)
             .payload(payload)
             .build()
         {
-            Ok(m) => {
-                self.msgs.push(m);
-                self.staged_bytes += payload_len;
-            }
+            Ok(m) => m,
             Err(err) => {
                 tracing::warn!(
                     sink_id = %self.sink_id,
@@ -714,16 +775,46 @@ impl Publisher {
                     topic,
                     err
                 );
+                return;
             }
-        }
-        if self.msgs.len() >= PUBLISH_CHUNK {
-            self.flush().await;
+        };
+
+        match self.mode {
+            SolaceDeliveryMode::Direct => {
+                self.msgs.push(message);
+                self.staged_bytes += payload_len;
+                if self.msgs.len() >= PUBLISH_CHUNK {
+                    self.flush().await;
+                }
+            }
+            SolaceDeliveryMode::Persistent => {
+                self.statistics.inc_messages_staged_by(1);
+                self.statistics.inc_bytes_staged_by(payload_len);
+                // publish_with_ack registers the correlation before the
+                // blocking C publish, so run the whole call off-thread.
+                let session = Arc::clone(&self.session);
+                let sink_id = self.sink_id;
+                let result = mz_ore::task::spawn_blocking(
+                    || format!("solace_sink_publish({sink_id})"),
+                    move || session.publish_with_ack(message),
+                )
+                .await;
+                match result {
+                    Ok(rx) => self.pending_acks.push((time, rx)),
+                    Err(err) => {
+                        // The message never left; block the frontier at its
+                        // time by halting so the restart replays it.
+                        self.fatal = Some(format!("persistent publish failed: {err}"));
+                    }
+                }
+            }
         }
     }
 
-    /// Publish all staged messages. A failure drops the staged chunk (Direct
-    /// delivery has no confirmation to retry against) and is reflected in the
-    /// staged-vs-committed statistics gap and `consecutive_failures`.
+    /// Publish all staged Direct messages. A failure drops the staged chunk
+    /// (Direct delivery has no confirmation to retry against) and is reflected
+    /// in the staged-vs-committed statistics gap and `consecutive_failures`.
+    /// No-op in persistent mode, which publishes eagerly in [`Self::stage`].
     async fn flush(&mut self) {
         if self.msgs.is_empty() {
             return;
@@ -764,6 +855,42 @@ impl Publisher {
                 );
             }
         }
+    }
+
+    /// Persistent mode only: await the broker acks for every outstanding
+    /// message whose input timestamp is below `frontier`, so the caller may
+    /// advance the durable upper to `frontier` only once that data is
+    /// confirmed delivered. A rejected ack or dropped sender sets [`fatal`],
+    /// which halts the sink so the restart replays from the last confirmed
+    /// upper. Direct mode is a no-op (delivery is not confirmed).
+    async fn confirm_through(&mut self, frontier: &Antichain<Timestamp>) {
+        if self.mode != SolaceDeliveryMode::Persistent {
+            return;
+        }
+        // A message at `time` is below the frontier when the frontier is not
+        // less-or-equal to it, i.e. every frontier element is strictly
+        // greater. For the closed (empty) frontier this is true of every time.
+        let below = |time: &Timestamp| !frontier.less_equal(time);
+        let mut still_pending = Vec::with_capacity(self.pending_acks.len());
+        // Draining in insertion (broker) order keeps confirmation monotonic.
+        for (time, rx) in std::mem::take(&mut self.pending_acks) {
+            if !below(&time) {
+                still_pending.push((time, rx));
+                continue;
+            }
+            match rx.await {
+                Ok(Ok(())) => {
+                    self.statistics.inc_messages_committed_by(1);
+                }
+                Ok(Err(err)) => {
+                    self.fatal = Some(format!("broker rejected a persistent message: {err}"));
+                }
+                Err(_) => {
+                    self.fatal = Some("persistent ack channel closed before delivery".to_string());
+                }
+            }
+        }
+        self.pending_acks = still_pending;
     }
 }
 

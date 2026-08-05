@@ -823,12 +823,25 @@ impl<R: ConnectionResolver> IntoInlineConnection<IcebergSinkConnection, R>
     }
 }
 
+/// Whether the Solace sink publishes with broker delivery confirmation.
+///
+/// `Direct` is fire-and-forget (at-most-once): the write frontier follows the
+/// input regardless of delivery. `Persistent` uses guaranteed messaging and
+/// advances the frontier only past data the broker has acknowledged, so a
+/// restart re-publishes unacknowledged data (at-least-once).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default, Serialize, Deserialize)]
+pub enum SolaceDeliveryMode {
+    #[default]
+    Direct,
+    Persistent,
+}
+
 /// Connection parameters for a Solace sink.
 ///
-/// Publishes rows as direct JSON messages to a Solace topic derived from a
-/// template string with `{column_name}` placeholders substituted per-row.
-/// Only `mz_diff > 0` rows are published; retractions are silently dropped.
-/// Optional dedup window suppresses re-publishing the same topic within a
+/// Publishes rows as JSON messages to a Solace topic derived from a template
+/// string with `{column_name}` placeholders substituted per-row. Only
+/// `mz_diff > 0` rows are published; retractions are silently dropped. An
+/// optional dedup window suppresses re-publishing the same topic within a
 /// configurable time interval.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SolaceSinkConnection<C: ConnectionAccess = InlinedConnection> {
@@ -842,6 +855,8 @@ pub struct SolaceSinkConnection<C: ConnectionAccess = InlinedConnection> {
     pub topic_column_indices: Vec<(String, usize)>,
     /// If `Some`, suppress re-publishing the same rendered topic within this window.
     pub dedup_window: Option<Duration>,
+    /// Direct (at-most-once) or persistent (at-least-once) delivery.
+    pub delivery_mode: SolaceDeliveryMode,
 }
 
 impl<R: ConnectionResolver> IntoInlineConnection<SolaceSinkConnection, R>
@@ -855,6 +870,7 @@ impl<R: ConnectionResolver> IntoInlineConnection<SolaceSinkConnection, R>
             topic,
             topic_column_indices,
             dedup_window,
+            delivery_mode,
         } = self;
         SolaceSinkConnection {
             connection_id,
@@ -863,6 +879,7 @@ impl<R: ConnectionResolver> IntoInlineConnection<SolaceSinkConnection, R>
             topic,
             topic_column_indices,
             dedup_window,
+            delivery_mode,
         }
     }
 }

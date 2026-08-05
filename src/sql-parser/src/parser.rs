@@ -4184,11 +4184,15 @@ impl<'a> Parser<'a> {
     fn parse_solace_sink_config_option(
         &mut self,
     ) -> Result<SolaceSinkConfigOption<Raw>, ParserError> {
-        let name = match self.expect_one_of_keywords(&[TOPIC, DEDUP])? {
+        let name = match self.expect_one_of_keywords(&[TOPIC, DEDUP, DELIVERY])? {
             TOPIC => SolaceSinkConfigOptionName::Topic,
             DEDUP => {
                 self.expect_keyword(WINDOW)?;
                 SolaceSinkConfigOptionName::DedupWindow
+            }
+            DELIVERY => {
+                self.expect_keyword(MODE)?;
+                SolaceSinkConfigOptionName::DeliveryMode
             }
             _ => unreachable!(),
         };

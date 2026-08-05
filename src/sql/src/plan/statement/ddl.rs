@@ -88,7 +88,8 @@ use mz_storage_types::connections::inline::ReferencedConnection;
 use mz_storage_types::connections::{Connection, KafkaTopicOptions};
 use mz_storage_types::sinks::{
     IcebergSinkConnection, KafkaIdStyle, KafkaSinkConnection, KafkaSinkFormat, KafkaSinkFormatType,
-    SinkEnvelope, SolaceSinkConnection, StorageSinkConnection, iceberg_type_overrides,
+    SinkEnvelope, SolaceDeliveryMode, SolaceSinkConnection, StorageSinkConnection,
+    iceberg_type_overrides,
 };
 use mz_storage_types::sources::encoding::{
     AvroEncoding, ColumnSpec, CsvEncoding, DataEncoding, ProtobufEncoding, RegexEncoding,
@@ -4118,11 +4119,19 @@ fn solace_sink_builder(
     let crate::solace_util::SolaceSinkConfigOptionExtracted {
         topic,
         dedup_window,
+        delivery_mode,
         seen: _,
     }: crate::solace_util::SolaceSinkConfigOptionExtracted = options.try_into()?;
 
     let Some(topic_template) = topic else {
         sql_bail!("Solace sink must specify TOPIC");
+    };
+
+    // DELIVERY MODE: "direct" (at-most-once) or "persistent" (at-least-once).
+    let delivery_mode = match delivery_mode.to_ascii_lowercase().as_str() {
+        "direct" => SolaceDeliveryMode::Direct,
+        "persistent" => SolaceDeliveryMode::Persistent,
+        other => sql_bail!("DELIVERY MODE must be direct or persistent, got {other:?}"),
     };
 
     // Parse {column_name} placeholders in the topic template and resolve to column indices.
@@ -4150,6 +4159,13 @@ fn solace_sink_builder(
     // (OptionalDuration maps a zero interval to None).
     let dedup_window = dedup_window.and_then(|d| d.0);
 
+    // Persistent delivery tracks a broker ack per published message to gate
+    // the frontier, which the conflation buffer does not model. Reject the
+    // combination rather than silently ignore one of them.
+    if dedup_window.is_some() && delivery_mode == SolaceDeliveryMode::Persistent {
+        sql_bail!("DEDUP WINDOW is not supported with DELIVERY MODE persistent");
+    }
+
     Ok(StorageSinkConnection::Solace(SolaceSinkConnection {
         connection_id,
         connection: connection_id,
@@ -4157,6 +4173,7 @@ fn solace_sink_builder(
         topic: topic_template,
         topic_column_indices,
         dedup_window,
+        delivery_mode,
     }))
 }
 
