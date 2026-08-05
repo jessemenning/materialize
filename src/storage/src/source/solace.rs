@@ -9,24 +9,26 @@
 
 //! Code to render the ingestion dataflow of a [`SolaceSourceConnection`].
 //!
-//! # Phase 3b — exactly-once protocol
+//! # Exactly-once protocol
 //!
 //! The reader runs a single async loop that multiplexes three sources of work:
 //!
 //! 1. **`flow.recv()`** — the broker delivers a new message. The reader
 //!    extracts the broker-assigned `ReplicationGroupMessageId` (RGMID), checks
-//!    it against the persisted watermark for dedup, and either drops + acks the
-//!    message (if it is a post-restart redelivery of an already-committed
-//!    record) or emits a `SourceMessage` timestamped by the RGMID and buffers
-//!    the Solace message-id for later acknowledgement.
+//!    it against the emitted boundary for dedup, and either drops the message
+//!    (a redelivery of an already-emitted record, acking it if it is also
+//!    durable) or emits a `SourceMessage` timestamped by the RGMID and buffers
+//!    the Solace message-id for later acknowledgement. Redelivery happens both
+//!    on restart and mid-run when the C SDK transparently reconnects, so the
+//!    boundary guard is what keeps exactly-once from breaking on a reconnect.
 //!
 //! 2. **`resume_uppers`** — Materialize's reclock layer reports that data up to
 //!    some frontier has been durably written to persist. The reader records
 //!    that boundary, and a budgeted drain (run after every loop iteration)
 //!    acks pending `(rgmid, msg_id)` pairs whose `rgmid` is strictly below it
 //!    via `flow.ack(msg_id)`. This is the Solace-side commit that lets the
-//!    broker remove the messages from the spool — and is the load-bearing
-//!    piece of the exactly-once protocol: data is durable in persist *before*
+//!    broker remove the messages from the spool, and is the load-bearing
+//!    piece of the exactly-once protocol: data is durable in persist before
 //!    the broker is told to forget it.
 //!
 //! 3. **Probe tick** — a [`probe::Ticker`] emits a `Probe` carrying the
@@ -40,12 +42,9 @@
 //!    downstream timestamp churn, at one binding per interval regardless of
 //!    message rate.
 //!
-//! Phase 3c follow-ups: `INCLUDE`-metadata column population (currently the
-//! metadata row is empty; the planner sets up the column shape but the
-//! runtime does not yet fill it), `DURABLE TOPIC ENDPOINT` bind, format
-//! decoding verification through the existing decoder pipeline, and a
-//! mzcompose testdrive against a live `solace/solace-pubsub-standard`
-//! container.
+//! Connectivity is reflected in health status: session and flow events drive
+//! `stalled`/`running` transitions, and an unrecoverable flow closure halts so
+//! the dataflow is suspended and restarted rather than silently completing.
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
@@ -71,8 +70,9 @@ use mz_timely_util::containers::stack::FueledBuilder;
 use solace_rs::SolaceLogLevel;
 use solace_rs::async_support::AsyncSessionBuilder;
 use solace_rs::context::Context;
-use solace_rs::flow::AckMode;
+use solace_rs::flow::{AckMode, FlowEvent};
 use solace_rs::message::Message;
+use solace_rs::session::SessionEvent;
 use timely::container::CapacityContainerBuilder;
 use timely::dataflow::operators::Capability;
 use timely::dataflow::operators::core::Partition;
@@ -212,7 +212,6 @@ fn render_reader<'scope>(
             // Downgrading it with synthetic timestamps caused it to diverge
             // from data_cap and silently fail later downgrades.
             let [mut data_cap, health_cap, probe_cap] = caps.try_into().unwrap();
-            let mut health_cap = Some(health_cap);
 
             if !is_active_worker {
                 return;
@@ -271,13 +270,16 @@ fn render_reader<'scope>(
             {
                 Ok(p) => p,
                 Err(err) => {
-                    emit_halting(
+                    emit_health(
                         &health_output,
-                        &mut health_cap,
+                        &health_cap,
                         &export_ids,
-                        format!(
-                            "failed to read PASSWORD secret: {}",
-                            err.display_with_causes()
+                        HealthStatusUpdate::halting(
+                            format!(
+                                "failed to read PASSWORD secret: {}",
+                                err.display_with_causes()
+                            ),
+                            None,
                         ),
                     );
                     std::future::pending::<()>().await;
@@ -291,13 +293,16 @@ fn render_reader<'scope>(
             let context = match Context::new(SolaceLogLevel::Error) {
                 Ok(ctx) => ctx,
                 Err(err) => {
-                    emit_halting(
+                    emit_health(
                         &health_output,
-                        &mut health_cap,
+                        &health_cap,
                         &export_ids,
-                        format!(
-                            "failed to initialize Solace context: {}",
-                            err.display_with_causes()
+                        HealthStatusUpdate::halting(
+                            format!(
+                                "failed to initialize Solace context: {}",
+                                err.display_with_causes()
+                            ),
+                            None,
                         ),
                     );
                     std::future::pending::<()>().await;
@@ -308,6 +313,25 @@ fn render_reader<'scope>(
             let host = connection.connection.host.clone();
             let msg_vpn = connection.connection.msg_vpn.clone();
             let username = connection.connection.username.clone();
+
+            let queue_name = match &connection.bind_entity {
+                SolaceBindEntity::Queue { name } => name.clone(),
+                SolaceBindEntity::TopicEndpoint { .. } => {
+                    // The planner rejects DURABLE TOPIC ENDPOINT; this is a
+                    // backstop for catalog contents that predate that check.
+                    emit_health(
+                        &health_output,
+                        &health_cap,
+                        &export_ids,
+                        HealthStatusUpdate::halting(
+                            "DURABLE TOPIC ENDPOINT binds are not supported".to_owned(),
+                            None,
+                        ),
+                    );
+                    std::future::pending::<()>().await;
+                    unreachable!("pending future never returns");
+                }
+            };
 
             let mut builder = AsyncSessionBuilder::new(&context)
                 .host_name(host.clone())
@@ -329,64 +353,85 @@ fn render_reader<'scope>(
                 builder = builder.ssl_trust_store_dir(dir);
             }
 
-            let session = builder.build();
-            let session = match session {
-                Ok(s) => s,
-                Err(err) => {
-                    emit_halting(
-                        &health_output,
-                        &mut health_cap,
-                        &export_ids,
-                        format!(
-                            "failed to open Solace session to {host} (vpn {msg_vpn}): {}",
-                            err.display_with_causes()
-                        ),
-                    );
-                    std::future::pending::<()>().await;
-                    unreachable!("pending future never returns");
-                }
-            };
-
-            let queue_name = match &connection.bind_entity {
-                SolaceBindEntity::Queue { name } => name.clone(),
-                SolaceBindEntity::TopicEndpoint { .. } => {
-                    emit_halting(
-                        &health_output,
-                        &mut health_cap,
-                        &export_ids,
-                        "DURABLE TOPIC ENDPOINT bind is not yet supported in the runtime (Phase 6)"
-                            .to_owned(),
-                    );
-                    std::future::pending::<()>().await;
-                    unreachable!("pending future never returns");
-                }
-            };
-
-            let mut flow = match session.create_flow(
-                &queue_name,
-                if connection.auto_ack {
+            // Session connect and queue bind are blocking FFI exchanges (an
+            // unreachable broker holds the C SDK's blocking connect for tens
+            // of seconds), so run them on a blocking thread rather than
+            // stalling this timely worker and every dataflow sharing it.
+            let connect = {
+                let host = host.clone();
+                let msg_vpn = msg_vpn.clone();
+                let queue_name = queue_name.clone();
+                let ack_mode = if connection.auto_ack {
                     AckMode::Auto
                 } else {
                     AckMode::Client
-                },
-                connection.ack_window_size,
-                Some(connection.flow_max_unacked),
-            ) {
-                Ok(f) => f,
-                Err(err) => {
-                    emit_halting(
+                };
+                let ack_window_size = connection.ack_window_size;
+                let flow_max_unacked = connection.flow_max_unacked;
+                mz_ore::task::spawn_blocking(
+                    || format!("solace_source_connect({})", config.id),
+                    move || {
+                        let session = builder.build().map_err(|err| {
+                            format!(
+                                "failed to open Solace session to {host} (vpn {msg_vpn}): {}",
+                                err.display_with_causes()
+                            )
+                        })?;
+                        let mut flow = session
+                            .create_flow(
+                                &queue_name,
+                                ack_mode,
+                                ack_window_size,
+                                Some(flow_max_unacked),
+                            )
+                            .map_err(|err| {
+                                format!(
+                                    "failed to bind to queue '{queue_name}': {}",
+                                    err.display_with_causes()
+                                )
+                            })?;
+                        flow.start().map_err(|err| {
+                            format!(
+                                "failed to start Solace flow on '{queue_name}': {}",
+                                err.display_with_causes()
+                            )
+                        })?;
+                        Ok::<_, String>((session, flow))
+                    },
+                )
+                .await
+            };
+            let (mut session, mut flow) = match connect {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(error)) => {
+                    emit_health(
                         &health_output,
-                        &mut health_cap,
+                        &health_cap,
                         &export_ids,
-                        format!(
-                            "failed to bind to queue '{queue_name}': {}",
-                            err.display_with_causes()
+                        HealthStatusUpdate::halting(error, None),
+                    );
+                    std::future::pending::<()>().await;
+                    unreachable!("pending future never returns");
+                }
+                Err(err) => {
+                    emit_health(
+                        &health_output,
+                        &health_cap,
+                        &export_ids,
+                        HealthStatusUpdate::halting(
+                            format!("Solace connect task failed: {}", err.display_with_causes()),
+                            None,
                         ),
                     );
                     std::future::pending::<()>().await;
                     unreachable!("pending future never returns");
                 }
             };
+
+            // Session events (connectivity) are consumed by this operator to
+            // drive health status. Taking the receiver also prevents the
+            // otherwise-undrained unbounded channel from accumulating events.
+            let mut session_events = session.take_event_receiver();
 
             if connection.flow_max_unacked == -1 {
                 warn!(
@@ -396,20 +441,6 @@ fn render_reader<'scope>(
                      buffering (pending acks and the receive channel) is unbounded. \
                      Set an explicit FLOW MAX UNACKED to bound source memory."
                 );
-            }
-
-            if let Err(err) = flow.start() {
-                emit_halting(
-                    &health_output,
-                    &mut health_cap,
-                    &export_ids,
-                    format!(
-                        "failed to start Solace flow on '{queue_name}': {}",
-                        err.display_with_causes()
-                    ),
-                );
-                std::future::pending::<()>().await;
-                unreachable!("pending future never returns");
             }
 
             info!(
@@ -422,7 +453,12 @@ fn render_reader<'scope>(
                 "Solace source bound; entering receive loop"
             );
 
-            emit_running(&health_output, &mut health_cap, &export_ids);
+            emit_health(
+                &health_output,
+                &health_cap,
+                &export_ids,
+                HealthStatusUpdate::running(),
+            );
 
             // (rgmid, msg_id) pairs awaiting persist-commit before they can be
             // acked to the broker. Ordered by RGMID within this flow.
@@ -490,6 +526,22 @@ fn render_reader<'scope>(
             // antichain.
             let mut ack_boundary: Option<SolaceTimestamp> = None;
 
+            // Everything strictly below this boundary has already been
+            // emitted downstream (or was durable before this restart). Any
+            // arriving RGMID below it is a broker redelivery, which happens
+            // both on restart and mid-run when the C SDK transparently
+            // reconnects and rebinds the flow. Redeliveries must never be
+            // re-emitted: by the time one arrives the data capability has
+            // advanced past its timestamp and remap has minted bindings
+            // covering it, so re-emitting would hand reclock a record at a
+            // closed timestamp. Advanced past each emitted message.
+            let mut emitted_boundary = initial_watermark;
+
+            // Whether the last emitted health status was `running`. Used to
+            // emit stalled/running transitions exactly once as connectivity
+            // events arrive.
+            let mut connectivity_healthy = true;
+
             loop {
                 // NOTE: arm order is load-bearing. The tick arm must outrank
                 // the recv arm so that probes (and the frontier flush they
@@ -532,11 +584,25 @@ fn render_reader<'scope>(
                     // O(batch_rate).
                     msg = flow.recv() => {
                         let Some(first) = msg else {
-                            warn!(
-                                source_id = %config.id,
-                                "Solace flow recv() returned None; ending source"
+                            // The message channel closing means the flow (and
+                            // its redelivery machinery) is gone. Halt so the
+                            // health operator suspends and restarts the
+                            // dataflow, which rebuilds the session and
+                            // rebinds. Returning instead would drop our
+                            // capabilities, advancing the source frontier to
+                            // the empty antichain, which permanently marks
+                            // the ingestion as finished.
+                            emit_health(
+                                &health_output,
+                                &health_cap,
+                                &export_ids,
+                                HealthStatusUpdate::halting(
+                                    "Solace flow receive channel closed".to_owned(),
+                                    None,
+                                ),
                             );
-                            return;
+                            std::future::pending::<()>().await;
+                            unreachable!("pending future never returns");
                         };
 
                         // Drain all currently-available messages into the
@@ -632,15 +698,29 @@ fn render_reader<'scope>(
                                 }
                             };
 
-                            // Dedup-on-restart: broker redelivery of an already-
-                            // committed RGMID. Ack and skip.
-                            if ts < initial_watermark {
-                                if let Err(err) = flow.ack(msg_id) {
-                                    warn!(
-                                        source_id = %config.id,
-                                        error = %err.display_with_causes(),
-                                        "failed to ack dedup-skipped Solace message"
-                                    );
+                            // Dedup: an RGMID below the emitted boundary is a
+                            // broker redelivery, either of a message that was
+                            // durable before this restart or of one delivered
+                            // again after an SDK-transparent flow rebind. Skip
+                            // it, and ack only when it is known durable in
+                            // persist. A not-yet-durable redelivery still has
+                            // its original (rgmid, msg_id) entry in
+                            // pending_acks (broker message ids are spool ids,
+                            // stable across redelivery), which acks it after
+                            // the persist commit. Acking it here instead would
+                            // tell the broker to forget data Materialize could
+                            // still lose in a crash.
+                            if ts < emitted_boundary {
+                                let durable = ts < initial_watermark
+                                    || ack_boundary.as_ref().is_some_and(|b| ts < *b);
+                                if durable {
+                                    if let Err(err) = flow.ack(msg_id) {
+                                        warn!(
+                                            source_id = %config.id,
+                                            error = %err.display_with_causes(),
+                                            "failed to ack dedup-skipped Solace message"
+                                        );
+                                    }
                                 }
                                 continue;
                             }
@@ -721,6 +801,13 @@ fn render_reader<'scope>(
                             });
                             // One ack entry per message regardless of export count.
                             ack_batch.push((ts, msg_id));
+                            // Emitted timestamps are strictly increasing: the
+                            // dedup guard above dropped anything below the
+                            // boundary, and RGMIDs are unique, so `ts.next()`
+                            // only ever moves the boundary forward.
+                            if let Some(next) = ts.next() {
+                                emitted_boundary = next;
+                            }
                         }
 
                         // Nothing to emit — all messages were invalid or deduped.
@@ -728,11 +815,11 @@ fn render_reader<'scope>(
                             continue;
                         };
 
-                        // ONE capability downgrade covers every timestamp in the batch.
-                        if data_cap.time() < &max_ts {
-                            data_cap.downgrade(&max_ts);
-                        }
-
+                        // Give the whole batch, then downgrade once. Every
+                        // batch timestamp is at or above the capability: the
+                        // emitted-boundary guard makes emitted timestamps
+                        // strictly increasing and the capability never
+                        // advances past the previous batch's successor.
                         for (ts, export_idx, source_message) in emit_batch.drain(..) {
                             let update = (
                                 (export_idx, Ok::<_, DataflowError>(source_message)),
@@ -741,6 +828,11 @@ fn render_reader<'scope>(
                             );
                             let size = update.fuel_size();
                             data_output.give_fueled(&data_cap, update, size).await;
+                        }
+
+                        // ONE capability downgrade covers every timestamp in the batch.
+                        if data_cap.time() < &max_ts {
+                            data_cap.downgrade(&max_ts);
                         }
 
                         // Pending acks are populated after capability downgrade so
@@ -762,6 +854,64 @@ fn render_reader<'scope>(
                             });
                         }
                     }
+                }
+
+                // Drain connectivity events non-blockingly and reflect the
+                // most recent state in health status. The loop wakes at least
+                // once per probe interval, so status lags connectivity by at
+                // most one tick. Session events describe the transport,
+                // drained first; flow events describe the queue bind and win
+                // when both arrive in one iteration.
+                let mut transition: Option<Option<String>> = None;
+                while let Ok(event) = session_events.try_recv() {
+                    match event {
+                        SessionEvent::UpNotice | SessionEvent::ReconnectedNotice => {
+                            transition = Some(None);
+                        }
+                        SessionEvent::DownError
+                        | SessionEvent::ConnectFailedError
+                        | SessionEvent::ReconnectingNotice => {
+                            transition = Some(Some(format!("Solace session event: {event}")));
+                        }
+                        _ => {}
+                    }
+                }
+                while let Ok(event) = flow.try_recv_event() {
+                    match event {
+                        FlowEvent::UpNotice | FlowEvent::Reconnected => {
+                            transition = Some(None);
+                        }
+                        FlowEvent::DownError
+                        | FlowEvent::BindFailedError
+                        | FlowEvent::SessionDown
+                        | FlowEvent::Reconnecting => {
+                            transition = Some(Some(format!("Solace flow event: {event}")));
+                        }
+                        _ => {}
+                    }
+                }
+                match transition {
+                    Some(None) if !connectivity_healthy => {
+                        connectivity_healthy = true;
+                        info!(source_id = %config.id, "Solace connectivity restored");
+                        emit_health(
+                            &health_output,
+                            &health_cap,
+                            &export_ids,
+                            HealthStatusUpdate::running(),
+                        );
+                    }
+                    Some(Some(error)) if connectivity_healthy => {
+                        connectivity_healthy = false;
+                        warn!(source_id = %config.id, %error, "Solace connectivity lost");
+                        emit_health(
+                            &health_output,
+                            &health_cap,
+                            &export_ids,
+                            HealthStatusUpdate::stalled(error, None),
+                        );
+                    }
+                    _ => {}
                 }
 
                 // Ack up to ACK_DRAIN_BUDGET committed messages per iteration,
@@ -964,19 +1114,29 @@ fn system_time_to_datum<'a>(ts: Option<std::time::SystemTime>) -> Datum<'a> {
 /// Compute the source's initial watermark from the persisted resume frontiers
 /// across all exports. Returns `SolaceTimestamp(None)` when the source is
 /// starting fresh (no rows ever written to persist).
+///
+/// The watermark is the MEET (minimum) across exports, matching how the Kafka
+/// source assembles its resume offsets. A lagging or newly added export must
+/// see redelivered messages the other exports already committed, so those
+/// messages must pass dedup and be re-emitted. Re-emitting them to the
+/// already-committed exports is harmless: persist filters appends below each
+/// export's shard upper. Taking the max instead would dedup-and-ack messages
+/// the lagging export never received, losing them permanently. An export with
+/// an empty upper is complete and imposes no constraint.
 fn compute_initial_watermark(
     source_resume_uppers: &BTreeMap<GlobalId, Vec<Row>>,
 ) -> SolaceTimestamp {
-    let mut watermark = SolaceTimestamp(None);
+    let mut watermark: Option<SolaceTimestamp> = None;
     for rows in source_resume_uppers.values() {
         for row in rows {
             let t = SolaceTimestamp::decode_row(row);
-            if t > watermark {
-                watermark = t;
-            }
+            watermark = Some(match watermark {
+                None => t,
+                Some(w) => std::cmp::min(w, t),
+            });
         }
     }
-    watermark
+    watermark.unwrap_or(SolaceTimestamp(None))
 }
 
 /// Pop pending `(rgmid, msg_id)` entries whose RGMID is strictly below the
@@ -1036,57 +1196,25 @@ fn emit_probe(
     );
 }
 
-/// Emit a `Running` health status across all exports plus the global slot.
-fn emit_running(
+/// Emit a health status across all exports plus the global slot. The
+/// capability is borrowed, not consumed, so the reader can keep cycling
+/// between `stalled` and `running` as broker connectivity comes and goes.
+fn emit_health(
     health_output: &AsyncOutputHandle<
         SolaceTimestamp,
         CapacityContainerBuilder<Vec<HealthStatusMessage>>,
     >,
-    health_cap: &mut Option<Capability<SolaceTimestamp>>,
+    health_cap: &Capability<SolaceTimestamp>,
     export_ids: &[GlobalId],
+    update: HealthStatusUpdate,
 ) {
-    let Some(cap) = health_cap.take() else {
-        return;
-    };
     for id in export_ids
         .iter()
         .map(|id| Some(*id))
         .chain(std::iter::once(None))
     {
         health_output.give(
-            &cap,
-            HealthStatusMessage {
-                id,
-                namespace: StatusNamespace::Solace,
-                update: HealthStatusUpdate::running(),
-            },
-        );
-    }
-}
-
-/// Emit a `Halting` health status across all exports plus the global slot
-/// and consume the capability — the source has hit a fatal initialization
-/// error and will not produce more updates.
-fn emit_halting(
-    health_output: &AsyncOutputHandle<
-        SolaceTimestamp,
-        CapacityContainerBuilder<Vec<HealthStatusMessage>>,
-    >,
-    health_cap: &mut Option<Capability<SolaceTimestamp>>,
-    export_ids: &[GlobalId],
-    error: String,
-) {
-    let Some(cap) = health_cap.take() else {
-        return;
-    };
-    let update = HealthStatusUpdate::halting(error, None);
-    for id in export_ids
-        .iter()
-        .map(|id| Some(*id))
-        .chain(std::iter::once(None))
-    {
-        health_output.give(
-            &cap,
+            health_cap,
             HealthStatusMessage {
                 id,
                 namespace: StatusNamespace::Solace,
