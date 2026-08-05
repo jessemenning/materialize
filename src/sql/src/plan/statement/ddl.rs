@@ -4146,9 +4146,9 @@ fn solace_sink_builder(
             .collect::<Result<Vec<_>, PlanError>>()?
     };
 
-    // A zero-length DEDUP WINDOW disables deduplication (OptionalDuration
-    // maps a zero interval to None).
-    let dedup_window = dedup_window.0;
+    // A zero-length or unset DEDUP WINDOW disables deduplication
+    // (OptionalDuration maps a zero interval to None).
+    let dedup_window = dedup_window.and_then(|d| d.0);
 
     Ok(StorageSinkConnection::Solace(SolaceSinkConnection {
         connection_id,
