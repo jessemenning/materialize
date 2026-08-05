@@ -2,7 +2,7 @@
 
 ## Context
 
-You are implementing a new streaming source connector for Materialize that reads from Solace PubSub+ brokers using guaranteed (persistent) messaging. This is a net-new source type, alongside the existing Kafka, PostgreSQL, MySQL, SQL Server, and Webhook sources.
+You are implementing a new streaming source connector for Materialize that reads from Solace Platform brokers using guaranteed (persistent) messaging. This is a net-new source type, alongside the existing Kafka, PostgreSQL, MySQL, SQL Server, and Webhook sources.
 
 The Solace source is differentiated from the Kafka source in one important way: it provides **exactly-once ingestion into Materialize's persist layer** by leveraging Solace's broker-side acknowledgment protocol and the broker-assigned, monotonic `ReplicationGroupMessageId` (RGMID). Users should not need to write `DISTINCT ON` views to deduplicate after restart-induced redeliveries — the source handles this transparently.
 
@@ -290,7 +290,7 @@ Roughly, the work decomposes into:
 ## Testing
 
 1. **Unit tests** — parser, planner, individual operator pieces, RGMID comparison.
-2. **Integration tests against a real broker** — use the Solace PubSub+ Standard Docker image (free, no license needed for non-prod). Cover:
+2. **Integration tests against a real broker** — use the `solace/solace-pubsub-standard` Docker image (free, no license needed for non-prod). Cover:
    - Basic queue consumption with each FORMAT.
    - DTE consumption with `*` and `>` wildcards.
    - All `INCLUDE` columns return correct values.
