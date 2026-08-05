@@ -86,7 +86,11 @@ class Stm(Service):
 
 SERVICES = [
     Solace(),
-    Materialized(sanity_restart=False),
+    Materialized(
+        sanity_restart=False,
+        # The Solace connector is gated behind an off-by-default feature flag.
+        additional_system_parameter_defaults={"enable_solace": "true"},
+    ),
     Testdrive(),
     Stm(),
 ]
@@ -393,6 +397,15 @@ def workflow_round_trip(c: Composition, parser: WorkflowArgumentParser) -> None:
     c.run_testdrive_files("round-trip.td")
 
 
+def workflow_negative(c: Composition, parser: WorkflowArgumentParser) -> None:
+    """Planning-time rejections for invalid Solace DDL. All errors fire before
+    broker I/O, so no queue provisioning or published messages are needed."""
+    parser.parse_args()
+
+    c.up("materialized")
+    c.run_testdrive_files("negative.td")
+
+
 def workflow_exactly_once(c: Composition, parser: WorkflowArgumentParser) -> None:
     """Crash Materialize between publish and re-select; verify zero
     duplicates and zero loss after restart."""
@@ -680,7 +693,10 @@ PERF_GOALS: dict[str, dict] = {
         "flow_max_unacked": 10000,
         "ack_mode": "auto",
         "parallelism": 1,
-        "deduplicate": False,
+        # At-most-once comes from ack_mode=auto. DEDUPLICATE=false is rejected
+        # at planning (at-least-once is unimplementable with RGMID timestamps),
+        # and restart dedup is a no-op under auto-ack anyway.
+        "deduplicate": True,
         "probe_interval": "500ms",
     },
 }

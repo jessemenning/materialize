@@ -21,7 +21,7 @@
 #   the CI builder Docker container, which is a ~20 minute step on a cold
 #   cache.
 #
-#   Source workflows: round-trip, exactly-once
+#   Source workflows: negative, round-trip, exactly-once
 #   Sink workflows:  sink-round-trip, sink-dedup, sink-dynamic-topic, sink-reconnect
 #
 # Upstream Materialize CI runs on Buildkite (`ci/test/pipeline.template.yml`),
@@ -189,7 +189,11 @@ jobs:
       - name: Log in to ghcr.io
         run: echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u jessemenning --password-stdin
 
+      - name: Run negative workflow
+        run: ./bin/mzcompose --find solace --dev --image-registry ghcr.io/jessemenning/materialize-solace run negative
+
       - name: Run round-trip workflow
+        if: success()
         run: ./bin/mzcompose --find solace --dev --image-registry ghcr.io/jessemenning/materialize-solace run round-trip
 
       - name: Run exactly-once workflow
