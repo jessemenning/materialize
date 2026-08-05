@@ -447,6 +447,16 @@ fn render_reader<'scope>(
                 HealthStatusUpdate::running(),
             );
 
+            // Initialize the offset gauges so mz_source_statistics reports a
+            // row. Solace has no numeric offset (the RGMID is the cursor), so
+            // these stay at 0; messages/bytes received are the live counters.
+            for id in &export_ids {
+                if let Some(stats) = config.statistics.get(id) {
+                    stats.set_offset_known(0);
+                    stats.set_offset_committed(0);
+                }
+            }
+
             // (rgmid, msg_id) pairs awaiting persist-commit before they can be
             // acked to the broker. Ordered by RGMID within this flow.
             //
@@ -732,6 +742,7 @@ fn render_reader<'scope>(
                                     msg.get_payload().ok().flatten().map(|p| p.to_vec())
                                 })
                                 .unwrap_or_default();
+                            let payload_len = u64::cast_from(payload.len());
 
                             let mut key_row = {
                                 let mut row = Row::default();
@@ -780,6 +791,15 @@ fn render_reader<'scope>(
                                     export_idx,
                                     SourceMessage { key, value, metadata },
                                 ));
+
+                                // Per-export ingest counters feed
+                                // mz_source_statistics. Each export that
+                                // receives this message counts it once, so the
+                                // aggregate reflects fan-out.
+                                if let Some(stats) = config.statistics.get(&export_ids[export_idx]) {
+                                    stats.inc_messages_received_by(1);
+                                    stats.inc_bytes_received_by(payload_len);
+                                }
                             }
 
                             max_ts = Some(match max_ts.take() {
