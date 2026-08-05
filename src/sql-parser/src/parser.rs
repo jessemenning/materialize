@@ -5036,7 +5036,7 @@ impl<'a> Parser<'a> {
                                 let n: u32 = n.try_into().map_err(|_| {
                                     ParserError::new(
                                         parser.peek_prev_pos(),
-                                        "TOPIC LEVELS COUNT must fit in u32",
+                                        "TOPIC LEVELS COUNT is too large",
                                     )
                                 })?;
                                 parser.expect_token(&Token::RParen)?;

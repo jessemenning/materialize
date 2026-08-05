@@ -3005,15 +3005,32 @@ impl SolaceConnection {
         true
     }
 
-    #[allow(clippy::unused_async)]
+    /// Validate the connection without a broker round-trip: check the host
+    /// URL scheme and that the PASSWORD secret resolves. A full broker bind
+    /// needs the Solace client, which is a storage-runtime dependency not
+    /// available in this crate, so bad hosts and credentials still surface
+    /// only when a source or sink starts. The secret check catches the most
+    /// common misconfiguration (a missing or unreadable secret) up front.
     async fn validate(
         &self,
         _id: CatalogItemId,
-        _storage_configuration: &StorageConfiguration,
+        storage_configuration: &StorageConfiguration,
     ) -> Result<(), anyhow::Error> {
-        // Real broker bind-and-probe lands in Phase 2 (planner) alongside the
-        // SQL VALIDATE CONNECTION wiring; for the storage-types skeleton we
-        // accept all configurations.
+        if !(self.host.starts_with("tcp://")
+            || self.host.starts_with("tcps://")
+            || self.host.starts_with("ws://")
+            || self.host.starts_with("wss://"))
+        {
+            anyhow::bail!(
+                "host must start with tcp://, tcps://, ws://, or wss://, got {:?}",
+                self.host
+            );
+        }
+        storage_configuration
+            .connection_context
+            .secrets_reader
+            .read_string(self.password)
+            .await?;
         Ok(())
     }
 }

@@ -755,6 +755,7 @@ impl ConnectionOptionExtracted {
                 ConnectionDetails::IcebergCatalog(IcebergCatalogConnection { catalog, uri })
             }
             CreateConnectionType::Solace => {
+                scx.require_feature_flag(&vars::ENABLE_SOLACE)?;
                 let host = self
                     .host
                     .ok_or_else(|| sql_err!("HOST option is required"))?;

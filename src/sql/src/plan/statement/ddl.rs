@@ -1340,6 +1340,8 @@ fn plan_solace_source_connection(
     options: &Vec<ast::SolaceSourceConfigOption<Aug>>,
     include_metadata: &Vec<SourceIncludeMetadata>,
 ) -> Result<SolaceSourceConnection<ReferencedConnection>, PlanError> {
+    scx.require_feature_flag(&vars::ENABLE_SOLACE)?;
+
     let connection_item = scx.get_item_by_resolved_name(connection_name)?;
     if !matches!(connection_item.connection()?, Connection::Solace(_)) {
         sql_bail!(
@@ -1361,14 +1363,16 @@ fn plan_solace_source_connection(
     }: crate::solace_util::SolaceSourceConfigOptionExtracted = options.clone().try_into()?;
 
     // QUEUE vs DURABLE TOPIC ENDPOINT: exactly one of these is required, and
-    // TOPIC SUBSCRIPTION only makes sense paired with a DTE bind.
+    // TOPIC SUBSCRIPTION only makes sense paired with a DTE bind. The runtime
+    // implements only the queue bind, so a valid DTE combination is rejected
+    // here rather than crash-looping the source at start.
     let bind_entity = match (queue, durable_topic_endpoint, topic_subscription.clone()) {
         (Some(name), None, None) => SolaceBindEntity::Queue { name },
-        (None, Some(name), Some(subscription)) => {
-            SolaceBindEntity::TopicEndpoint { name, subscription }
+        (None, Some(_), Some(_)) => {
+            sql_bail!("DURABLE TOPIC ENDPOINT is not yet supported")
         }
         (Some(_), Some(_), _) => {
-            sql_bail!("QUEUE and DURABLE TOPIC ENDPOINT are mutually exclusive; specify only one")
+            sql_bail!("QUEUE and DURABLE TOPIC ENDPOINT are mutually exclusive")
         }
         (None, Some(_), None) => {
             sql_bail!("DURABLE TOPIC ENDPOINT requires a paired TOPIC SUBSCRIPTION")
@@ -1381,36 +1385,31 @@ fn plan_solace_source_connection(
         }
     };
 
-    // ACK WINDOW SIZE: positive u32.
-    let ack_window_size = u32::try_from(ack_window_size).map_err(|_| {
-        sql_err!(
-            "ACK WINDOW SIZE must be a positive integer that fits in 32 bits, got {ack_window_size}"
-        )
-    })?;
+    // ACK WINDOW SIZE: positive.
     if ack_window_size == 0 {
         sql_bail!("ACK WINDOW SIZE must be greater than zero");
     }
 
-    // FLOW MAX UNACKED: i32 (-1 means broker-configured default).
-    let flow_max_unacked = i32::try_from(flow_max_unacked).map_err(|_| {
-        sql_err!("FLOW MAX UNACKED must fit in a signed 32-bit integer, got {flow_max_unacked}")
-    })?;
+    // FLOW MAX UNACKED: -1 (broker-configured default) or positive.
     if flow_max_unacked == 0 || flow_max_unacked < -1 {
         sql_bail!("FLOW MAX UNACKED must be -1 or a positive integer");
     }
 
-    // PARALLELISM: positive u32; MVP only supports 1.
-    let parallelism = u32::try_from(parallelism).map_err(|_| {
-        sql_err!("PARALLELISM must be a positive integer that fits in 32 bits, got {parallelism}")
-    })?;
+    // DEDUPLICATE = false promises at-least-once ingestion, which the
+    // runtime cannot deliver: the RGMID doubles as the source timestamp, so a
+    // redelivered message cannot be re-emitted once the source frontier has
+    // passed it. Reject rather than silently ingest exactly-once.
+    if !deduplicate {
+        sql_bail!("DEDUPLICATE = false is not yet supported");
+    }
+
+    // PARALLELISM: positive. The runtime clamps ingestion to a single worker,
+    // so values above 1 are rejected rather than silently ignored.
     if parallelism == 0 {
         sql_bail!("PARALLELISM must be at least 1");
     }
-    if parallelism > 1 && deduplicate {
-        sql_bail!(
-            "PARALLELISM > 1 on a non-partitioned queue requires DEDUPLICATE = false. \
-             For exactly-once parallelism, use a partitioned queue (Phase 8)."
-        );
+    if parallelism > 1 {
+        sql_bail!("PARALLELISM greater than 1 is not yet supported");
     }
 
     // ACK MODE: "auto" or "client" (case-insensitive).
@@ -1479,16 +1478,24 @@ fn plan_solace_source_connection(
             }
             // Kafka-specific items are not valid for Solace sources.
             SourceIncludeMetadata::Key { .. } => {
-                sql_bail!("INCLUDE KEY is not supported for Solace sources; use UPSERT KEY (...) with INCLUDE columns instead")
+                sql_bail!(
+                    "INCLUDE KEY is not supported for Solace sources, use UPSERT KEY (...) with INCLUDE columns instead"
+                )
             }
             SourceIncludeMetadata::Timestamp { .. } => {
-                sql_bail!("INCLUDE TIMESTAMP is not supported for Solace sources; use INCLUDE BROKER TIMESTAMP or INCLUDE SENDER TIMESTAMP")
+                sql_bail!(
+                    "INCLUDE TIMESTAMP is not supported for Solace sources, use INCLUDE BROKER TIMESTAMP or INCLUDE SENDER TIMESTAMP"
+                )
             }
             SourceIncludeMetadata::Offset { .. } => {
-                sql_bail!("INCLUDE OFFSET is not supported for Solace sources; the queue is the cursor (use INCLUDE REPLICATION GROUP MESSAGE ID for a per-message identifier)")
+                sql_bail!(
+                    "INCLUDE OFFSET is not supported for Solace sources, use INCLUDE REPLICATION GROUP MESSAGE ID for a per-message identifier"
+                )
             }
             SourceIncludeMetadata::Headers { .. } | SourceIncludeMetadata::Header { .. } => {
-                sql_bail!("INCLUDE HEADERS is not supported for Solace sources; use INCLUDE USER PROPERTIES")
+                sql_bail!(
+                    "INCLUDE HEADERS is not supported for Solace sources, use INCLUDE USER PROPERTIES"
+                )
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1633,10 +1640,13 @@ fn apply_source_envelope_encoding(
             key_columns,
             value_decode_err_policy,
         } => {
-            // MetadataKey path: key comes from INCLUDE metadata columns (e.g. TOPIC LEVELS).
-            // Bypasses the key/value encoding requirement since Solace FORMAT JSON has no
-            // native message key field — the GUFI lives in the topic, not the payload.
+            // MetadataKey path: the key comes from INCLUDE metadata columns
+            // (e.g. TOPIC LEVELS). It bypasses the key/value encoding
+            // requirement because Solace FORMAT JSON has no native message key
+            // field. Only reachable via the new `KEY (...)` syntax, so gate it
+            // behind the Solace flag while leaving legacy UPSERT ungated.
             if !key_columns.is_empty() {
+                scx.require_feature_flag(&vars::ENABLE_SOLACE)?;
                 let key_col_names: Vec<ColumnName> = key_columns
                     .iter()
                     .map(|c| normalize::column_name(c.clone()))
@@ -1650,11 +1660,11 @@ fn apply_source_envelope_encoding(
                 let mut key_indices = Vec::with_capacity(key_col_names.len());
                 for name in &key_col_names {
                     let (meta_idx, _) = metadata_desc.get_by_name(name).ok_or_else(|| {
+                        // The key must name an INCLUDE metadata column (e.g.
+                        // from INCLUDE TOPIC LEVELS), not a value column.
                         sql_err!(
-                            "key column '{}' not found in source metadata; \
-                             ENVELOPE UPSERT (KEY (...)) requires columns from INCLUDE TOPIC LEVELS \
-                             or another INCLUDE metadata clause",
-                            name
+                            "key column {} not found in source metadata",
+                            name.as_str().quoted()
                         )
                     })?;
                     key_metadata_indices.push(meta_idx);
@@ -3557,12 +3567,26 @@ fn plan_sink(
         // Solace sinks are append-only (publish on mz_diff > 0, ignore retractions)
         (CreateSinkConnection::Solace { .. }, None, None) => SinkEnvelope::Append,
         (CreateSinkConnection::Solace { .. }, Some(_), _) => {
-            sql_bail!("Solace sinks do not support ENVELOPE; omit the clause")
+            sql_bail!("ENVELOPE is not supported for Solace sinks")
         }
         (CreateSinkConnection::Solace { .. }, _, Some(_)) => {
             sql_bail!("MODE is not supported for Solace sinks")
         }
     };
+
+    // The Solace sink always encodes as JSON and has no batching interval, so
+    // reject FORMAT and COMMIT INTERVAL rather than parse and ignore them.
+    if matches!(connection, CreateSinkConnection::Solace { .. }) {
+        if format.is_some() {
+            sql_bail!("FORMAT is not supported for Solace sinks")
+        }
+        if with_options
+            .iter()
+            .any(|o| matches!(o.name, CreateSinkOptionName::CommitInterval))
+        {
+            sql_bail!("COMMIT INTERVAL is not supported for Solace sinks")
+        }
+    }
 
     let from_name = &from;
     let from = scx.get_item_by_resolved_name(&from)?;
@@ -4080,14 +4104,13 @@ fn solace_sink_builder(
     options: Vec<ast::SolaceSinkConfigOption<Aug>>,
     value_desc: RelationDesc,
 ) -> Result<StorageSinkConnection<ReferencedConnection>, PlanError> {
+    scx.require_feature_flag(&vars::ENABLE_SOLACE)?;
+
     let connection_item = scx.get_item_by_resolved_name(&connection_name)?;
     if !matches!(connection_item.connection()?, Connection::Solace(_)) {
         sql_bail!(
             "{} is not a Solace connection",
-            scx.catalog
-                .resolve_full_name(connection_item.name())
-                .to_string()
-                .quoted()
+            scx.catalog.resolve_full_name(connection_item.name())
         );
     }
     let connection_id = connection_item.id();
@@ -4114,8 +4137,8 @@ fn solace_sink_builder(
                     .map(|(i, _)| i)
                     .ok_or_else(|| {
                         sql_err!(
-                            "column '{}' referenced in TOPIC template does not exist",
-                            col_name_str
+                            "column {} referenced in TOPIC template does not exist",
+                            col_name_str.quoted()
                         )
                     })?;
                 Ok((col_name_str, idx))
@@ -4123,13 +4146,9 @@ fn solace_sink_builder(
             .collect::<Result<Vec<_>, PlanError>>()?
     };
 
-    // Parse optional DEDUP WINDOW duration string (e.g. "15s", "60s").
-    let dedup_window = dedup_window
-        .map(|s| {
-            humantime::parse_duration(&s)
-                .map_err(|_| sql_err!("invalid DEDUP WINDOW duration '{}'; expected e.g. '15s'", s))
-        })
-        .transpose()?;
+    // A zero-length DEDUP WINDOW disables deduplication (OptionalDuration
+    // maps a zero interval to None).
+    let dedup_window = dedup_window.0;
 
     Ok(StorageSinkConnection::Solace(SolaceSinkConnection {
         connection_id,
