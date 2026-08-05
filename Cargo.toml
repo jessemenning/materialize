@@ -485,7 +485,7 @@ scopeguard = "1.2.0"
 seahash = "4.1.0"
 segment = { version = "0.2.6", default-features = false, features = ["native-tls-vendored"] }
 semver = "1.0.28"
-solace-rs = { git = "https://github.com/jessemenning/solace-rs.git", tag = "v0.9.3", features = ["async"] }
+solace-rs = { git = "https://github.com/jessemenning/solace-rs.git", rev = "9787d31c71c206c2d9e09b51935b52d66df260a5", features = ["async"] }
 sentry = { version = "0.48.2", default-features = false, features = ["backtrace", "contexts", "debug-images", "transport"] }
 sentry-panic = "0.48.2"
 sentry-tracing = "0.48.2"
