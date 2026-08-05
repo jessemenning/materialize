@@ -17,18 +17,31 @@
 //! wins) and flushed once the window elapses, so subscribers always converge
 //! to the newest value even if the input then goes quiet.
 //!
-//! Delivery is fire-and-forget Direct messaging with no durable output shard,
-//! so the sink reports at-most-once progress: the write frontier follows the
-//! input frontier once batches have been handed to the Solace session.
+//! # Delivery semantics
 //!
-//! NOTE: dedup state is per timely worker. Each worker throttles the topics
-//! it renders independently, so a topic whose rows are spread across N
-//! workers can publish up to N messages per window.
+//! Delivery is fire-and-forget Direct messaging with no durable output shard,
+//! so the sink is at-most-once: the write frontier follows the input frontier
+//! once batches have been handed to the Solace session, whether or not the
+//! broker received them. Two caveats sharpen that contract:
+//!
+//! * **Restart duplicate window.** On restart the sink resumes from its
+//!   durable shard upper, but the dataflow as_of trails it (it is the sink's
+//!   since), and there is no resume-time filtering, so updates between the
+//!   as_of and the pre-crash upper are published again. Every clusterd
+//!   restart can therefore re-publish a small window of recent updates.
+//!
+//! * **Per-worker ordering.** Rows are distributed across timely workers by
+//!   hash of the whole row, so two updates rendering to the same topic can
+//!   land on different workers, each with its own session, and reach the
+//!   broker in either order. Within one worker, publishes are ordered by
+//!   input timestamp. Dedup state is likewise per worker: a topic whose rows
+//!   are spread across N workers can publish up to N messages per window.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::Write as FmtWrite;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use itertools::Itertools as _;
@@ -48,22 +61,25 @@ use mz_storage_types::errors::DataflowError;
 use mz_storage_types::sinks::{SolaceSinkConnection, StorageSinkDesc};
 use mz_storage_types::sources::SourceData;
 use mz_timely_util::builder_async::{
-    Event, OperatorBuilder as AsyncOperatorBuilder, PressOnDropButton,
+    AsyncOutputHandle, Event, OperatorBuilder as AsyncOperatorBuilder, PressOnDropButton,
 };
 use serde_json::Value;
 use solace_rs::SolaceLogLevel;
-use solace_rs::async_support::AsyncSessionBuilder;
+use solace_rs::async_support::{AsyncSession, AsyncSessionBuilder};
 use solace_rs::context::Context;
 use solace_rs::message::{
     DeliveryMode, DestinationType, MessageDestination, OutboundMessage, OutboundMessageBuilder,
 };
+use solace_rs::session::SessionEvent;
 use timely::PartialOrder;
 use timely::container::CapacityContainerBuilder;
 use timely::dataflow::StreamVec;
+use timely::dataflow::operators::Capability;
 use timely::progress::{Antichain, Timestamp as _};
 
 use crate::healthcheck::{HealthStatusMessage, HealthStatusUpdate, StatusNamespace};
 use crate::render::sinks::{SinkBatchStream, SinkRender};
+use crate::statistics::SinkStatistics;
 use crate::storage_state::StorageState;
 
 impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
@@ -88,7 +104,7 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
         Vec<PressOnDropButton>,
     ) {
         let connection = self.clone();
-        let secrets_reader = std::sync::Arc::clone(
+        let secrets_reader = Arc::clone(
             &storage_state
                 .storage_configuration
                 .connection_context
@@ -107,15 +123,15 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
         let progress_leader =
             usize::cast_from(sink_id.hashed()) % batches.scope().peers() == batches.scope().index();
         let progress_handle = progress_leader.then(|| {
-            let persist = std::sync::Arc::clone(&storage_state.persist_clients);
+            let persist = Arc::clone(&storage_state.persist_clients);
             let shard_meta = sink.to_storage_metadata.clone();
             async move {
                 let client = persist.open(shard_meta.persist_location).await?;
                 let handle = client
                     .open_writer::<SourceData, (), Timestamp, StorageDiff>(
                         shard_meta.data_shard,
-                        std::sync::Arc::new(shard_meta.relation_desc),
-                        std::sync::Arc::new(UnitSchema),
+                        Arc::new(shard_meta.relation_desc),
+                        Arc::new(UnitSchema),
                         Diagnostics::from_purpose("sink handle"),
                     )
                     .await?;
@@ -162,32 +178,48 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
             {
                 Ok(p) => p,
                 Err(err) => {
-                    tracing::warn!(
-                        sink_id = %sink_id,
-                        "Solace sink: failed to read PASSWORD secret: {}",
-                        err.display_with_causes()
+                    // NOTE: startup failures must emit a halting status, not
+                    // return. Returning would drop our capabilities and leave
+                    // the write frontier behind, either pinning the sink's
+                    // reported upper at 0 (read hold held forever) or, if
+                    // cleared, reporting the empty antichain, which the
+                    // controller reads as "sink complete". Halting makes the
+                    // health operator suspend and restart the dataflow, which
+                    // is the retry.
+                    emit_sink_health(
+                        &health_output,
+                        &health_cap,
+                        sink_id,
+                        HealthStatusUpdate::halting(
+                            format!(
+                                "failed to read PASSWORD secret: {}",
+                                err.display_with_causes()
+                            ),
+                            None,
+                        ),
                     );
-                    // NOTE: every abort must clear the shared frontier to the
-                    // empty antichain (Kafka does the same). A worker that
-                    // returns with the frontier still at `minimum()` pins the
-                    // sink's reported upper at 0, which holds the input's read
-                    // hold at the as_of forever and lets the shard grow
-                    // without bound.
-                    write_frontier.borrow_mut().clear();
-                    return;
+                    std::future::pending::<()>().await;
+                    unreachable!("pending future never returns");
                 }
             };
 
             let context = match Context::new(SolaceLogLevel::Error) {
                 Ok(ctx) => ctx,
                 Err(err) => {
-                    tracing::warn!(
-                        sink_id = %sink_id,
-                        "Solace sink: failed to initialize context: {}",
-                        err.display_with_causes()
+                    emit_sink_health(
+                        &health_output,
+                        &health_cap,
+                        sink_id,
+                        HealthStatusUpdate::halting(
+                            format!(
+                                "failed to initialize Solace context: {}",
+                                err.display_with_causes()
+                            ),
+                            None,
+                        ),
                     );
-                    write_frontier.borrow_mut().clear();
-                    return;
+                    std::future::pending::<()>().await;
+                    unreachable!("pending future never returns");
                 }
             };
 
@@ -195,7 +227,7 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
             let msg_vpn = connection.connection.msg_vpn.clone();
             let username = connection.connection.username.clone();
 
-            let mut builder = AsyncSessionBuilder::new(&context)
+            let mut session_builder = AsyncSessionBuilder::new(&context)
                 .host_name(host.clone())
                 .vpn_name(msg_vpn.clone())
                 .username(username.clone())
@@ -210,24 +242,48 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
             if host.starts_with("tcps://") || host.starts_with("wss://") {
                 let dir = std::env::var("SOLACE_SSL_TRUST_STORE_DIR")
                     .unwrap_or_else(|_| "/etc/ssl/certs".to_string());
-                builder = builder.ssl_trust_store_dir(dir);
+                session_builder = session_builder.ssl_trust_store_dir(dir);
             }
 
-            let session = builder.build();
-            let session = match session {
+            // Session connect is a blocking FFI exchange (an unreachable
+            // broker holds the C SDK's blocking connect for tens of seconds),
+            // so run it on a blocking thread rather than stalling this timely
+            // worker and every dataflow sharing it.
+            let session = mz_ore::task::spawn_blocking(
+                || format!("solace_sink_connect({sink_id})"),
+                move || session_builder.build(),
+            )
+            .await
+            .expect("solace connect task never panics");
+            let mut session = match session {
                 Ok(s) => s,
                 Err(err) => {
-                    tracing::warn!(
-                        sink_id = %sink_id,
-                        "Solace sink: failed to open session to {host} (vpn {msg_vpn}): {}",
-                        err.display_with_causes()
+                    emit_sink_health(
+                        &health_output,
+                        &health_cap,
+                        sink_id,
+                        HealthStatusUpdate::halting(
+                            format!(
+                                "failed to open Solace session to {host} (vpn {msg_vpn}): {}",
+                                err.display_with_causes()
+                            ),
+                            None,
+                        ),
                     );
-                    write_frontier.borrow_mut().clear();
-                    return;
+                    std::future::pending::<()>().await;
+                    unreachable!("pending future never returns");
                 }
             };
 
             tracing::info!(sink_id = %sink_id, "Solace sink connected to {host} (vpn {msg_vpn})");
+
+            // Session events (connectivity) drive the stalled/running health
+            // status. Taking the receiver also prevents the otherwise-
+            // undrained unbounded channel from accumulating events.
+            let mut session_events = session.take_event_receiver();
+            // Shared so publish calls can move to a blocking thread while the
+            // operator keeps its own handle.
+            let session = Arc::new(session);
 
             // The progress leader opens its persist writer only after the
             // broker session is up, so a sink that cannot connect never
@@ -236,31 +292,32 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                 Some(open) => match open.await {
                     Ok(handle) => Some(handle),
                     Err(err) => {
-                        tracing::warn!(
-                            sink_id = %sink_id,
-                            "Solace sink: failed to open persist progress handle: {}",
-                            err.display_with_causes()
+                        emit_sink_health(
+                            &health_output,
+                            &health_cap,
+                            sink_id,
+                            HealthStatusUpdate::halting(
+                                format!(
+                                    "failed to open persist progress handle: {}",
+                                    err.display_with_causes()
+                                ),
+                                None,
+                            ),
                         );
-                        write_frontier.borrow_mut().clear();
-                        return;
+                        std::future::pending::<()>().await;
+                        unreachable!("pending future never returns");
                     }
                 },
                 None => None,
             };
 
             // Signal running so Materialize transitions out of `starting`.
-            if let Some(ref cap) = health_cap {
-                for id in [Some(sink_id), None] {
-                    health_output.give(
-                        cap,
-                        HealthStatusMessage {
-                            id,
-                            namespace: StatusNamespace::Solace,
-                            update: HealthStatusUpdate::running(),
-                        },
-                    );
-                }
-            }
+            emit_sink_health(
+                &health_output,
+                &health_cap,
+                sink_id,
+                HealthStatusUpdate::running(),
+            );
 
             // Dedup state: rendered topic -> time of the last actual publish.
             let mut dedup_cache: BTreeMap<String, Instant> = BTreeMap::new();
@@ -271,19 +328,35 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
 
             let mut drop_stats = DropStats::new();
 
+            let mut publisher = Publisher {
+                session,
+                sink_id,
+                statistics,
+                msgs: Vec::new(),
+                staged_bytes: 0,
+                consecutive_failures: 0,
+            };
+
             // Reusable buffers declared outside the event loop so their heap
             // capacity persists across batches, avoiding per-batch allocations.
             let mut topic_buf = String::new();
-            let mut to_publish: Vec<(String, Vec<u8>)> = Vec::new();
-            let mut msgs_to_send: Vec<OutboundMessage> = Vec::new();
+            let mut to_publish: Vec<(Timestamp, String, Vec<u8>)> = Vec::new();
+
+            // Health state: `None` while the session is up, the stall reason
+            // while it is down. `reported_healthy` tracks the last emitted
+            // status so transitions are emitted exactly once.
+            let mut session_stall: Option<String> = None;
+            let mut reported_healthy = true;
+            let mut session_events_open = true;
 
             let mut input_closed = false;
             while !input_closed {
-                // Await the next input event, or the earliest pending flush
-                // deadline when the dedup window has payloads waiting.
-                // `Some(ev)` is an input event, `None` means the timer fired.
-                let wake = if pending.is_empty() {
-                    Some(input.next().await)
+                // Await the next input event, a session connectivity event, or
+                // the earliest pending flush deadline when the dedup window
+                // has payloads waiting. `Some(ev)` is an input event, `None`
+                // means the flush timer fired.
+                let flush_deadline = if pending.is_empty() {
+                    None
                 } else {
                     let window = connection
                         .dedup_window
@@ -298,14 +371,44 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                         })
                         .min()
                         .expect("pending is non-empty");
-                    tokio::select! {
-                        ev = input.next() => Some(ev),
-                        _ = tokio::time::sleep(deadline.saturating_duration_since(now)) => None,
-                    }
+                    Some(deadline.saturating_duration_since(now))
                 };
-
-                msgs_to_send.clear();
-                let mut staged_bytes = 0;
+                let wake = tokio::select! {
+                    ev = input.next() => Some(ev),
+                    ev = session_events.recv(), if session_events_open => {
+                        match ev {
+                            Some(event) => {
+                                match event {
+                                    SessionEvent::UpNotice
+                                    | SessionEvent::ReconnectedNotice => session_stall = None,
+                                    SessionEvent::DownError
+                                    | SessionEvent::ConnectFailedError
+                                    | SessionEvent::ReconnectingNotice => {
+                                        session_stall =
+                                            Some(format!("Solace session event: {event}"));
+                                    }
+                                    _ => {}
+                                }
+                                report_health(
+                                    &health_output,
+                                    &health_cap,
+                                    sink_id,
+                                    &mut reported_healthy,
+                                    &session_stall,
+                                    publisher.consecutive_failures,
+                                );
+                            }
+                            None => session_events_open = false,
+                        }
+                        continue;
+                    }
+                    _ = async {
+                        match flush_deadline {
+                            Some(d) => tokio::time::sleep(d).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => None,
+                };
 
                 match wake {
                     // Flush timer fired; fall through to the pending flush.
@@ -331,6 +434,12 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                         // what prevents a full re-snapshot on every restart.
                         // Input timestamps tick at the 1s timestamp_interval,
                         // so this costs about one consensus write per second.
+                        //
+                        // NOTE: the leader's input frontier is not a fleet-wide
+                        // lower bound: a slower peer worker can still hold
+                        // unpublished updates below it, which a crash at the
+                        // wrong moment then skips on restart. That widens the
+                        // at-most-once loss window beyond in-flight messages.
                         if let Some(handle) = progress_handle.as_mut() {
                             let mut expect_upper = handle.shared_upper();
                             while PartialOrder::less_than(&expect_upper, &frontier) {
@@ -350,7 +459,7 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                         to_publish.clear();
 
                         for batch in batches.drain(..) {
-                            for_each_diff_pair(&batch, |_key, _time, diff_pair: DiffPair<Row>| {
+                            for_each_diff_pair(&batch, |_key, time, diff_pair: DiffPair<Row>| {
                                 let Some(row) = diff_pair.after else {
                                     drop_stats.retractions += 1;
                                     return;
@@ -369,19 +478,23 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                                     return;
                                 }
                                 let payload = row_to_json(&row, &connection.value_desc);
-                                to_publish.push((topic_buf.clone(), payload));
+                                to_publish.push((time, topic_buf.clone(), payload));
                             });
                         }
 
-                        for (topic, payload) in to_publish.drain(..) {
+                        // `for_each_diff_pair` iterates in key order and only
+                        // guarantees time order within a key, but with
+                        // synthetic whole-row keys two versions of the same
+                        // logical entity are different keys. Publishing (and
+                        // conflating) in key order could then converge a topic
+                        // to a stale value whenever a batch spans multiple
+                        // timestamps. Sort by time so later updates win; the
+                        // sort is stable, preserving within-time order.
+                        to_publish.sort_by_key(|(time, _, _)| *time);
+
+                        for (_time, topic, payload) in to_publish.drain(..) {
                             let Some(window) = connection.dedup_window else {
-                                stage_message(
-                                    sink_id,
-                                    &topic,
-                                    payload,
-                                    &mut msgs_to_send,
-                                    &mut staged_bytes,
-                                );
+                                publisher.stage(&topic, payload).await;
                                 continue;
                             };
                             let now = Instant::now();
@@ -396,13 +509,7 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                                     drop_stats.conflated += 1;
                                 }
                                 note_published(&mut dedup_cache, &topic, now, window);
-                                stage_message(
-                                    sink_id,
-                                    &topic,
-                                    payload,
-                                    &mut msgs_to_send,
-                                    &mut staged_bytes,
-                                );
+                                publisher.stage(&topic, payload).await;
                             } else {
                                 if pending.insert(topic, payload).is_some() {
                                     drop_stats.conflated += 1;
@@ -413,13 +520,7 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                                 if pending.len() >= MAX_DEDUP_CACHE_ENTRIES {
                                     for (topic, payload) in std::mem::take(&mut pending) {
                                         note_published(&mut dedup_cache, &topic, now, window);
-                                        stage_message(
-                                            sink_id,
-                                            &topic,
-                                            payload,
-                                            &mut msgs_to_send,
-                                            &mut staged_bytes,
-                                        );
+                                        publisher.stage(&topic, payload).await;
                                     }
                                 }
                             }
@@ -449,30 +550,23 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                     for topic in due {
                         let payload = pending.remove(&topic).expect("due topic is pending");
                         note_published(&mut dedup_cache, &topic, now, window);
-                        stage_message(
-                            sink_id,
-                            &topic,
-                            payload,
-                            &mut msgs_to_send,
-                            &mut staged_bytes,
-                        );
+                        publisher.stage(&topic, payload).await;
                     }
                 }
 
-                if !msgs_to_send.is_empty() {
-                    let staged_msgs = u64::cast_from(msgs_to_send.len());
-                    statistics.inc_messages_staged_by(staged_msgs);
-                    statistics.inc_bytes_staged_by(staged_bytes);
-                    if let Err(err) = session.publish_multiple(&msgs_to_send) {
-                        tracing::warn!(
-                            sink_id = %sink_id,
-                            "Solace sink: publish_multiple failed: {}", err
-                        );
-                    } else {
-                        statistics.inc_messages_committed_by(staged_msgs);
-                        statistics.inc_bytes_committed_by(staged_bytes);
-                    }
-                }
+                // Publish anything staged below the chunk boundary.
+                publisher.flush().await;
+
+                // Persistent publish failure (with a live session) surfaces as
+                // a stalled status; recovery flips back to running.
+                report_health(
+                    &health_output,
+                    &health_cap,
+                    sink_id,
+                    &mut reported_healthy,
+                    &session_stall,
+                    publisher.consecutive_failures,
+                );
 
                 drop_stats.maybe_log(sink_id);
             }
@@ -491,6 +585,189 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
 /// (all within the window), the cache is cleared to prevent OOM on
 /// high-cardinality topic spaces.
 const MAX_DEDUP_CACHE_ENTRIES: usize = 100_000;
+
+/// Messages staged before a publish is forced. Matches the vendored crate's
+/// internal `publish_multiple` chunk size, so one flush is one FFI chunk:
+/// a failure loses at most one chunk rather than an arbitrarily large staged
+/// batch, and a whole-relation snapshot is never materialized as C-heap
+/// messages all at once.
+const PUBLISH_CHUNK: usize = 50;
+
+/// Consecutive failed publish calls before the sink reports itself stalled.
+const PUBLISH_STALL_THRESHOLD: u64 = 3;
+
+/// Health output handle for the sink operator.
+type SinkHealthOutput =
+    AsyncOutputHandle<Timestamp, CapacityContainerBuilder<Vec<HealthStatusMessage>>>;
+
+/// Emit a health status for the sink's export slot plus the global slot. The
+/// capability is borrowed, not consumed, so the sink can keep cycling between
+/// `stalled` and `running` as broker connectivity comes and goes.
+fn emit_sink_health(
+    health_output: &SinkHealthOutput,
+    health_cap: &Option<Capability<Timestamp>>,
+    sink_id: GlobalId,
+    update: HealthStatusUpdate,
+) {
+    let Some(cap) = health_cap else {
+        return;
+    };
+    for id in [Some(sink_id), None] {
+        health_output.give(
+            cap,
+            HealthStatusMessage {
+                id,
+                namespace: StatusNamespace::Solace,
+                update: update.clone(),
+            },
+        );
+    }
+}
+
+/// Emit a stalled/running transition if the desired state (derived from
+/// session connectivity and consecutive publish failures) differs from the
+/// last reported one.
+fn report_health(
+    health_output: &SinkHealthOutput,
+    health_cap: &Option<Capability<Timestamp>>,
+    sink_id: GlobalId,
+    reported_healthy: &mut bool,
+    session_stall: &Option<String>,
+    consecutive_publish_failures: u64,
+) {
+    let desired_stall: Option<String> = if let Some(reason) = session_stall {
+        Some(reason.clone())
+    } else if consecutive_publish_failures >= PUBLISH_STALL_THRESHOLD {
+        Some(format!(
+            "{consecutive_publish_failures} consecutive Solace publish failures"
+        ))
+    } else {
+        None
+    };
+    match desired_stall {
+        None if !*reported_healthy => {
+            *reported_healthy = true;
+            tracing::info!(sink_id = %sink_id, "Solace sink recovered");
+            emit_sink_health(
+                health_output,
+                health_cap,
+                sink_id,
+                HealthStatusUpdate::running(),
+            );
+        }
+        Some(reason) if *reported_healthy => {
+            *reported_healthy = false;
+            tracing::warn!(sink_id = %sink_id, %reason, "Solace sink stalled");
+            emit_sink_health(
+                health_output,
+                health_cap,
+                sink_id,
+                HealthStatusUpdate::stalled(reason, None),
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Stages outbound messages and publishes them in bounded chunks on a
+/// blocking thread.
+struct Publisher {
+    session: Arc<AsyncSession>,
+    sink_id: GlobalId,
+    statistics: SinkStatistics,
+    msgs: Vec<OutboundMessage>,
+    staged_bytes: u64,
+    /// Consecutive failed `publish_multiple` calls, reset on success. Drives
+    /// the stalled health status via [`report_health`].
+    consecutive_failures: u64,
+}
+
+impl Publisher {
+    /// Build a Direct-delivery message for `topic` and stage it, flushing
+    /// when a full chunk has accumulated. Rows whose topic or message cannot
+    /// be built are dropped with a warning.
+    async fn stage(&mut self, topic: &str, payload: Vec<u8>) {
+        let payload_len = u64::cast_from(payload.len());
+        let dest = match MessageDestination::new(DestinationType::Topic, topic) {
+            Ok(d) => d,
+            Err(err) => {
+                tracing::warn!(
+                    sink_id = %self.sink_id,
+                    "Solace sink: invalid topic '{}': {}", topic, err
+                );
+                return;
+            }
+        };
+        match OutboundMessageBuilder::new()
+            .delivery_mode(DeliveryMode::Direct)
+            .destination(dest)
+            .payload(payload)
+            .build()
+        {
+            Ok(m) => {
+                self.msgs.push(m);
+                self.staged_bytes += payload_len;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    sink_id = %self.sink_id,
+                    "Solace sink: failed to build message for topic '{}': {}",
+                    topic,
+                    err
+                );
+            }
+        }
+        if self.msgs.len() >= PUBLISH_CHUNK {
+            self.flush().await;
+        }
+    }
+
+    /// Publish all staged messages. A failure drops the staged chunk (Direct
+    /// delivery has no confirmation to retry against) and is reflected in the
+    /// staged-vs-committed statistics gap and `consecutive_failures`.
+    async fn flush(&mut self) {
+        if self.msgs.is_empty() {
+            return;
+        }
+        let staged_msgs = u64::cast_from(self.msgs.len());
+        let staged_bytes = self.staged_bytes;
+        self.statistics.inc_messages_staged_by(staged_msgs);
+        self.statistics.inc_bytes_staged_by(staged_bytes);
+        let msgs = std::mem::take(&mut self.msgs);
+        self.staged_bytes = 0;
+        // The C API publish is blocking (and serialized behind the session
+        // mutex), so run it on a blocking thread rather than stalling the
+        // timely worker. The message vector round-trips to preserve its
+        // allocated capacity.
+        let session = Arc::clone(&self.session);
+        let sink_id = self.sink_id;
+        let (result, mut msgs) = mz_ore::task::spawn_blocking(
+            || format!("solace_sink_publish({sink_id})"),
+            move || {
+                let result = session.publish_multiple(&msgs);
+                (result, msgs)
+            },
+        )
+        .await
+        .expect("solace publish task never panics");
+        msgs.clear();
+        self.msgs = msgs;
+        match result {
+            Ok(()) => {
+                self.consecutive_failures = 0;
+                self.statistics.inc_messages_committed_by(staged_msgs);
+                self.statistics.inc_bytes_committed_by(staged_bytes);
+            }
+            Err(err) => {
+                self.consecutive_failures += 1;
+                tracing::warn!(
+                    sink_id = %self.sink_id,
+                    "Solace sink: publish_multiple failed: {}", err
+                );
+            }
+        }
+    }
+}
 
 /// Record an actual publish to `topic` at `now`, evicting expired entries
 /// when the cache reaches its cap.
@@ -512,48 +789,6 @@ fn note_published(
         }
     }
     cache.insert(topic.to_string(), now);
-}
-
-/// Build a Direct-delivery message for `topic` and stage it for publishing,
-/// accumulating its payload size into `staged_bytes`. Rows whose topic or
-/// message cannot be built are dropped with a warning.
-fn stage_message(
-    sink_id: GlobalId,
-    topic: &str,
-    payload: Vec<u8>,
-    msgs: &mut Vec<OutboundMessage>,
-    staged_bytes: &mut u64,
-) {
-    let payload_len = u64::cast_from(payload.len());
-    let dest = match MessageDestination::new(DestinationType::Topic, topic) {
-        Ok(d) => d,
-        Err(err) => {
-            tracing::warn!(
-                sink_id = %sink_id,
-                "Solace sink: invalid topic '{}': {}", topic, err
-            );
-            return;
-        }
-    };
-    match OutboundMessageBuilder::new()
-        .delivery_mode(DeliveryMode::Direct)
-        .destination(dest)
-        .payload(payload)
-        .build()
-    {
-        Ok(m) => {
-            msgs.push(m);
-            *staged_bytes += payload_len;
-        }
-        Err(err) => {
-            tracing::warn!(
-                sink_id = %sink_id,
-                "Solace sink: failed to build message for topic '{}': {}",
-                topic,
-                err
-            );
-        }
-    }
 }
 
 /// Interval between rate-limited log lines summarizing unpublished rows.
@@ -642,7 +877,7 @@ enum TemplatePart {
 }
 
 /// Compile a topic template string into a `Vec<TemplatePart>` at sink
-/// initialization time. The resulting slice is passed to [`render_compiled`]
+/// initialization time. The resulting slice is passed to [`render_compiled_into`]
 /// on each row without any further string allocation.
 fn compile_template(template: &str, indices: &[(String, usize)]) -> Vec<TemplatePart> {
     // Build placeholder strings once so we don't format!() inside the loop.
