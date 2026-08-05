@@ -402,26 +402,13 @@ fn render_reader<'scope>(
                 .await
             };
             let (mut session, mut flow) = match connect {
-                Ok(Ok(pair)) => pair,
-                Ok(Err(error)) => {
+                Ok(pair) => pair,
+                Err(error) => {
                     emit_health(
                         &health_output,
                         &health_cap,
                         &export_ids,
                         HealthStatusUpdate::halting(error, None),
-                    );
-                    std::future::pending::<()>().await;
-                    unreachable!("pending future never returns");
-                }
-                Err(err) => {
-                    emit_health(
-                        &health_output,
-                        &health_cap,
-                        &export_ids,
-                        HealthStatusUpdate::halting(
-                            format!("Solace connect task failed: {}", err.display_with_causes()),
-                            None,
-                        ),
                     );
                     std::future::pending::<()>().await;
                     unreachable!("pending future never returns");

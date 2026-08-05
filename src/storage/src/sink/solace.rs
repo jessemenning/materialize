@@ -253,8 +253,7 @@ impl<'scope> SinkRender<'scope> for SolaceSinkConnection {
                 || format!("solace_sink_connect({sink_id})"),
                 move || session_builder.build(),
             )
-            .await
-            .expect("solace connect task never panics");
+            .await;
             let mut session = match session {
                 Ok(s) => s,
                 Err(err) => {
@@ -748,8 +747,7 @@ impl Publisher {
                 (result, msgs)
             },
         )
-        .await
-        .expect("solace publish task never panics");
+        .await;
         msgs.clear();
         self.msgs = msgs;
         match result {
